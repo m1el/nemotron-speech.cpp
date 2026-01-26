@@ -71,9 +71,9 @@ bool test_linear() {
     std::vector<uint8_t> buf(buf_size);
 
     struct ggml_init_params params = {
-        /*.mem_size   =*/ buf_size,
-        /*.mem_buffer =*/ buf.data(),
-        /*.no_alloc   =*/ true,
+        .mem_size   = buf_size,
+        .mem_buffer = buf.data(),
+        .no_alloc   = true,
     };
 
     struct ggml_context * ctx0 = ggml_init(params);
@@ -193,9 +193,9 @@ bool test_layer_norm() {
     std::vector<uint8_t> buf(buf_size);
 
     struct ggml_init_params params = {
-        /*.mem_size   =*/ buf_size,
-        /*.mem_buffer =*/ buf.data(),
-        /*.no_alloc   =*/ true,
+        .mem_size   = buf_size,
+        .mem_buffer = buf.data(),
+        .no_alloc   = true,
     };
 
     struct ggml_context * ctx0 = ggml_init(params);
@@ -285,9 +285,9 @@ bool test_swish() {
     std::vector<uint8_t> compute_buf(buf_size);
 
     struct ggml_init_params params = {
-        /*.mem_size   =*/ buf_size,
-        /*.mem_buffer =*/ compute_buf.data(),
-        /*.no_alloc   =*/ true,
+        .mem_size   = buf_size,
+        .mem_buffer = compute_buf.data(),
+        .no_alloc   = true,
     };
 
     struct ggml_context * ctx0 = ggml_init(params);
@@ -412,9 +412,9 @@ bool test_ffn() {
     std::vector<uint8_t> compute_buf(buf_size);
 
     struct ggml_init_params params = {
-        /*.mem_size   =*/ buf_size,
-        /*.mem_buffer =*/ compute_buf.data(),
-        /*.no_alloc   =*/ true,
+        .mem_size   = buf_size,
+        .mem_buffer = compute_buf.data(),
+        .no_alloc   = true,
     };
 
     struct ggml_context * ctx0 = ggml_init(params);
@@ -551,9 +551,9 @@ bool test_conv2d() {
     std::vector<uint8_t> compute_buf(buf_size);
 
     struct ggml_init_params params = {
-        /*.mem_size   =*/ buf_size,
-        /*.mem_buffer =*/ compute_buf.data(),
-        /*.no_alloc   =*/ true,
+        .mem_size   = buf_size,
+        .mem_buffer = compute_buf.data(),
+        .no_alloc   = true,
     };
 
     struct ggml_context * ctx0 = ggml_init(params);
@@ -820,9 +820,9 @@ bool test_conv_subsampling() {
     std::vector<uint8_t> compute_buf(buf_size);
 
     struct ggml_init_params params = {
-        /*.mem_size   =*/ buf_size,
-        /*.mem_buffer =*/ compute_buf.data(),
-        /*.no_alloc   =*/ true,
+        .mem_size   = buf_size,
+        .mem_buffer = compute_buf.data(),
+        .no_alloc   = true,
     };
 
     struct ggml_context * ctx0 = ggml_init(params);
