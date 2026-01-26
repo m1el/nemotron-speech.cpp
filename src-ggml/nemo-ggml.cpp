@@ -308,3 +308,106 @@ void nemo_free(struct nemo_context * ctx) {
         delete ctx;
     }
 }
+
+// ============================================================================
+// Graph building helpers
+// ============================================================================
+
+// Layer normalization: norm(x) * weight + bias
+static struct ggml_tensor * build_layer_norm(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,
+    struct ggml_tensor * weight,
+    struct ggml_tensor * bias,
+    float eps = 1e-5f
+) {
+    struct ggml_tensor * cur = ggml_norm(ctx, input, eps);
+    cur = ggml_mul(ctx, cur, weight);
+    cur = ggml_add(ctx, cur, bias);
+    return cur;
+}
+
+// Feed-forward module: Linear -> Swish -> Linear
+static struct ggml_tensor * build_ffn(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,
+    struct ggml_tensor * linear1_w,
+    struct ggml_tensor * linear2_w
+) {
+    // Linear1: [batch, time, d_model] -> [batch, time, d_ff]
+    struct ggml_tensor * cur = ggml_mul_mat(ctx, linear1_w, input);
+
+    // Swish activation (SiLU in ggml)
+    cur = ggml_silu(ctx, cur);
+
+    // Linear2: [batch, time, d_ff] -> [batch, time, d_model]
+    cur = ggml_mul_mat(ctx, linear2_w, cur);
+
+    return cur;
+}
+
+// GLU activation: split input in half, multiply first half by sigmoid of second half
+static struct ggml_tensor * build_glu(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input  // [channels*2, ...]
+) {
+    int64_t half_channels = input->ne[0] / 2;
+    int64_t ne1 = input->ne[1];
+    int64_t ne2 = input->ne[2];
+    int64_t ne3 = input->ne[3];
+
+    // First half
+    struct ggml_tensor * a = ggml_view_4d(ctx, input,
+        half_channels, ne1, ne2, ne3,
+        input->nb[1], input->nb[2], input->nb[3], 0);
+
+    // Second half
+    struct ggml_tensor * b = ggml_view_4d(ctx, input,
+        half_channels, ne1, ne2, ne3,
+        input->nb[1], input->nb[2], input->nb[3],
+        half_channels * ggml_element_size(input));
+
+    // a * sigmoid(b)
+    return ggml_mul(ctx, a, ggml_sigmoid(ctx, b));
+}
+
+// LSTM cell: returns (h_out, c_out)
+static void build_lstm_cell(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,      // [batch, input_size]
+    struct ggml_tensor * h_prev,     // [batch, hidden_size]
+    struct ggml_tensor * c_prev,     // [batch, hidden_size]
+    struct ggml_tensor * w_ih,       // [4*hidden_size, input_size]
+    struct ggml_tensor * w_hh,       // [4*hidden_size, hidden_size]
+    struct ggml_tensor * b_ih,       // [4*hidden_size]
+    struct ggml_tensor * b_hh,       // [4*hidden_size]
+    struct ggml_tensor ** h_out,
+    struct ggml_tensor ** c_out
+) {
+    int64_t hidden_size = h_prev->ne[0];
+
+    // gates = input @ W_ih.T + h_prev @ W_hh.T + b_ih + b_hh
+    struct ggml_tensor * gates_i = ggml_mul_mat(ctx, w_ih, input);
+    struct ggml_tensor * gates_h = ggml_mul_mat(ctx, w_hh, h_prev);
+    struct ggml_tensor * gates = ggml_add(ctx, gates_i, gates_h);
+    gates = ggml_add(ctx, gates, b_ih);
+    gates = ggml_add(ctx, gates, b_hh);
+
+    // Split gates: [i, f, g, o] each of size hidden_size
+    struct ggml_tensor * i_gate = ggml_view_1d(ctx, gates, hidden_size, 0 * hidden_size * sizeof(float));
+    struct ggml_tensor * f_gate = ggml_view_1d(ctx, gates, hidden_size, 1 * hidden_size * sizeof(float));
+    struct ggml_tensor * g_gate = ggml_view_1d(ctx, gates, hidden_size, 2 * hidden_size * sizeof(float));
+    struct ggml_tensor * o_gate = ggml_view_1d(ctx, gates, hidden_size, 3 * hidden_size * sizeof(float));
+
+    // Apply activations
+    i_gate = ggml_sigmoid(ctx, i_gate);
+    f_gate = ggml_sigmoid(ctx, f_gate);
+    g_gate = ggml_tanh(ctx, g_gate);
+    o_gate = ggml_sigmoid(ctx, o_gate);
+
+    // c = f * c_prev + i * g
+    *c_out = ggml_add(ctx, ggml_mul(ctx, f_gate, c_prev), ggml_mul(ctx, i_gate, g_gate));
+
+    // h = o * tanh(c)
+    *h_out = ggml_mul(ctx, o_gate, ggml_tanh(ctx, *c_out));
+}
