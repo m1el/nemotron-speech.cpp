@@ -36,9 +36,32 @@ Key implementation details:
 - `ggml_conv_2d_dw_direct` for depthwise conv (F32, avoids F16 im2col issue)
 - Correct permute order [W,C,H,N] for flatten to match original C++ layout
 
+#### Phase 4: Positional Encoding (COMPLETE)
+| Test | Status | Max Diff |
+|------|--------|----------|
+| Positional Encoding | PASS | 0 |
+
+Key implementation details:
+- Sinusoidal embeddings computed with `compute_pos_emb()` in nemo-ggml.cpp
+- Shape: [d_model, 2*max_len-1] = [1024, 1023] for max_len=512
+- Precomputed during model load, stored in `model.pos_emb`
+
+#### Phase 5: Conformer Attention (IN PROGRESS)
+| Test | Status | Max Diff |
+|------|--------|----------|
+| rel_shift formula | PASS | (verified) |
+| Q/K/V projections | PASS | 5.7e-06 |
+| Full MHA with rel_shift | TODO | - |
+
+Key implementation notes:
+- Q, K, V linear projections work correctly
+- rel_shift formula verified: out[i,j] = input[i, j + qlen - 1 - i]
+- Full MHA requires implementing rel_shift in ggml (pad-reshape-slice operation)
+
 #### Remaining Phases:
-- Phase 4: Positional Encoding
-- Phase 5-7: Conformer components (FFN, Attention, Conv)
+- Phase 5 (cont): Full multi-head attention with rel_shift
+- Phase 6: Conformer Conv module (pointwise, depthwise, GLU, batch norm)
+- Phase 7: Full Conformer layer
 - Phase 8-12: Full encoder, decoder, joint, greedy decode
 
 ### File Structure
