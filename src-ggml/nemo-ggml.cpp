@@ -26,7 +26,7 @@ static void compute_pos_emb(float * data, int max_len, int d_model) {
 }
 
 bool nemo_model_load(const std::string & path, nemo_model & model) {
-    printf("%s: loading model from '%s'\n", __func__, path.c_str());
+    // printf("%s: loading model from '%s'\n", __func__, path.c_str());
 
     // Initialize backend first
     model.backend = ggml_backend_cpu_init();
@@ -38,8 +38,8 @@ bool nemo_model_load(const std::string & path, nemo_model & model) {
     // Open GGUF file
     struct ggml_context * ctx_meta = nullptr;
     struct gguf_init_params params = {
-        /*.no_alloc =*/ true,
-        /*.ctx      =*/ &ctx_meta,
+        .no_alloc = true,
+        .ctx      = &ctx_meta,
     };
 
     struct gguf_context * gguf_ctx = gguf_init_from_file(path.c_str(), params);
@@ -89,23 +89,23 @@ bool nemo_model_load(const std::string & path, nemo_model & model) {
         memcpy(model.vocab.data(), vocab_data, vocab_bytes);
     }
 
-    printf("%s: n_mels     = %d\n", __func__, model.hparams.n_mels);
-    printf("%s: d_model    = %d\n", __func__, model.hparams.d_model);
-    printf("%s: n_heads    = %d\n", __func__, model.hparams.n_heads);
-    printf("%s: n_layers   = %d\n", __func__, model.hparams.n_layers);
-    printf("%s: vocab_size = %d\n", __func__, model.hparams.vocab_size);
-    printf("%s: vocab tokens = %zu\n", __func__, model.vocab.size());
+    // printf("%s: n_mels     = %d\n", __func__, model.hparams.n_mels);
+    // printf("%s: d_model    = %d\n", __func__, model.hparams.d_model);
+    // printf("%s: n_heads    = %d\n", __func__, model.hparams.n_heads);
+    // printf("%s: n_layers   = %d\n", __func__, model.hparams.n_layers);
+    // printf("%s: vocab_size = %d\n", __func__, model.hparams.vocab_size);
+    // printf("%s: vocab tokens = %zu\n", __func__, model.vocab.size());
 
     // Get tensor count
     int64_t n_tensors = gguf_get_n_tensors(gguf_ctx);
-    printf("%s: n_tensors  = %lld\n", __func__, (long long)n_tensors);
+    // printf("%s: n_tensors  = %lld\n", __func__, (long long)n_tensors);
 
     // Create weight context with no_alloc=true
     size_t ctx_size = ggml_tensor_overhead() * (n_tensors + 10);  // +10 for pos_emb
     struct ggml_init_params ctx_params = {
-        /*.mem_size   =*/ ctx_size,
-        /*.mem_buffer =*/ NULL,
-        /*.no_alloc   =*/ true,
+        .mem_size   = ctx_size,
+        .mem_buffer = NULL,
+        .no_alloc   = true,
     };
 
     model.ctx_w = ggml_init(ctx_params);
@@ -285,7 +285,7 @@ bool nemo_model_load(const std::string & path, nemo_model & model) {
         return false;
     }
 
-    printf("%s: model loaded successfully\n", __func__);
+    // printf("%s: model loaded successfully\n", __func__);
     return true;
 }
 
@@ -423,3 +423,14 @@ static void build_lstm_cell(
     // h = o * tanh(c)
     *h_out = ggml_mul(ctx, o_gate, ggml_tanh(ctx, *c_out));
 }
+
+// shut up unused function warning
+// TODO: remove when used
+int unused_functions() {
+    (void)build_lstm_cell;
+    (void)build_glu;
+    (void)build_ffn;
+    (void)build_layer_norm;
+    return 0;
+}
+int a = unused_functions();

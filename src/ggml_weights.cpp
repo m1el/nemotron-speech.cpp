@@ -47,7 +47,7 @@ bool ModelWeights::load(const std::string& path) {
         return false;
     }
 
-    printf("Loading %u tensors from %s\n", n_tensors, path.c_str());
+    // printf("Loading %u tensors from %s\n", n_tensors, path.c_str());
 
     // Read each tensor
     for (uint32_t i = 0; i < n_tensors; i++) {
@@ -152,7 +152,7 @@ bool ModelWeights::load(const std::string& path) {
     }
 
     fclose(f);
-    printf("Loaded %zu tensors, %zu total parameters\n", tensors_.size(), total_params());
+    // printf("Loaded %zu tensors, %zu total parameters\n", tensors_.size(), total_params());
     return true;
 }
 
