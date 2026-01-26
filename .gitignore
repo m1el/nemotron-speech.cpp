@@ -1,2 +1,14 @@
 *.bin
+*.o
+*.npy
 preprocessor
+nemotron-speech
+
+# Test binaries
+test_*
+debug_*
+dump_*
+
+# Editor files
+*.swp
+*~
