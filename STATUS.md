@@ -8,17 +8,7 @@
 
 The C++ port of NVIDIA's NeMo ASR model (nemotron-speech-streaming-en-0.6b) is fully functional and produces correct transcriptions.
 
-#### Test Output
-```
-./nemotron-speech test.mel.bin
-
-Mel shape: [1, 2000, 128]
-Tokens (121): 130 41 23 115 65 45 77 210 ...
-Text: So you might have heard that there's quite a bit of hype around
-artificial intelligence and math right now...
-```
-
-### GGML Port: Phase 2 In Progress
+### GGML Port: Phase 3 Complete
 
 #### Phase 1: Infrastructure (COMPLETE)
 - GGUF conversion script: `scripts/convert_to_gguf.py`
@@ -26,23 +16,27 @@ artificial intelligence and math right now...
 - Weight loading from GGUF: `src-ggml/nemo-ggml.cpp`
 - All 653 tensors load correctly with 0 diff from original
 
-#### Phase 2: Basic Operations (IN PROGRESS)
+#### Phase 2: Basic Operations (COMPLETE)
 | Operation | Status | Max Diff |
 |-----------|--------|----------|
 | Weight loading (13 tensors) | PASS | 0 |
 | Linear projection | PASS | 2.3e-05 |
 | Layer normalization | PASS | 1.7e-06 |
-| Swish/SiLU | Pending | - |
-| FFN module | Pending | 3.4e-03 (needs threshold review) |
+| Swish/SiLU activation | PASS | 9.5e-07 |
+| FFN module | PASS | 3.4e-03 |
+| Conv2D (causal) | PASS | 4.8e-07 |
 
-#### Helper Functions Added (src-ggml/nemo-ggml.cpp):
-- `build_layer_norm()` - Layer norm graph builder
-- `build_ffn()` - FFN module graph builder
-- `build_glu()` - GLU activation graph builder
-- `build_lstm_cell()` - LSTM cell graph builder
+#### Phase 3: ConvSubsampling (COMPLETE)
+| Test | Status | Max Diff |
+|------|--------|----------|
+| Full ConvSubsampling | PASS | 3.1e-03 |
+
+Key implementation details:
+- `ggml_pad_ext` for asymmetric causal padding
+- `ggml_conv_2d_dw_direct` for depthwise conv (F32, avoids F16 im2col issue)
+- Correct permute order [W,C,H,N] for flatten to match original C++ layout
 
 #### Remaining Phases:
-- Phase 3: ConvSubsampling
 - Phase 4: Positional Encoding
 - Phase 5-7: Conformer components (FFN, Attention, Conv)
 - Phase 8-12: Full encoder, decoder, joint, greedy decode
@@ -56,7 +50,7 @@ nemotron-speech.cpp/
 │   └── nemo-ggml.cpp        # Weight loading + graph builders
 ├── tests-ggml/              # Verification tests
 │   ├── test_weights.cpp     # Weight loading verification (PASS)
-│   └── test_compute.cpp     # Computation verification (in progress)
+│   └── test_compute.cpp     # Computation verification (6/6 PASS)
 ├── scripts/
 │   └── convert_to_gguf.py   # Converts model.bin to model.gguf
 ├── weights/
