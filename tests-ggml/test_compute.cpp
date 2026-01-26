@@ -2,6 +2,7 @@
 #include "../src-ggml/nemo-ggml.h"
 #include "../include/ggml_weights.h"
 #include "../include/ops.h"
+#include "../include/conv_subsampling.h"
 
 #include <cstdio>
 #include <cmath>
@@ -473,6 +474,509 @@ bool test_ffn() {
     return passed;
 }
 
+// Test Conv2D operation
+// Note: ggml uses different tensor layouts than PyTorch
+// PyTorch kernel: [OC, IC, KH, KW], input: [N, C, H, W]
+// ggml kernel: [KW, KH, IC, OC], input: [W, H, C, N]
+bool test_conv2d() {
+    printf("=== Testing Conv2D ===\n");
+
+    // Load original weights
+    nemo::ModelWeights ref_weights;
+    if (!ref_weights.load("weights/model.bin")) {
+        fprintf(stderr, "Failed to load reference weights\n");
+        return false;
+    }
+
+    // Load ggml weights
+    nemo_context * ctx = nemo_init("weights/model.gguf");
+    if (!ctx) {
+        fprintf(stderr, "Failed to load ggml model\n");
+        return false;
+    }
+
+    // Get conv0 weights (first conv in subsampling)
+    // Shape: [256, 1, 3, 3] in PyTorch [OC, IC, KH, KW]
+    const char * conv_w_name = "encoder.pre_encode.conv.0.weight";
+    const char * conv_b_name = "encoder.pre_encode.conv.0.bias";
+
+    const auto * ref_conv_w = ref_weights.get(conv_w_name);
+    const auto * ref_conv_b = ref_weights.get(conv_b_name);
+
+    auto it_w = ctx->model.tensors.find(conv_w_name);
+    auto it_b = ctx->model.tensors.find(conv_b_name);
+
+    if (!ref_conv_w || !ref_conv_b || it_w == ctx->model.tensors.end() || it_b == ctx->model.tensors.end()) {
+        fprintf(stderr, "Conv weight tensors not found\n");
+        nemo_free(ctx);
+        return false;
+    }
+
+    // PyTorch: [OC=256, IC=1, KH=3, KW=3]
+    int out_channels = ref_conv_w->shape[0];  // 256
+    int in_channels = ref_conv_w->shape[1];   // 1
+    int kH = ref_conv_w->shape[2];            // 3
+    int kW = ref_conv_w->shape[3];            // 3
+
+    printf("Conv weight shape (PyTorch): [%d, %d, %d, %d]\n", out_channels, in_channels, kH, kW);
+
+    // Create small test input [batch=1, channels=1, height=10, width=128]
+    int batch = 1;
+    int in_h = 10;
+    int in_w = 128;
+
+    // PyTorch layout: [N, C, H, W]
+    nemo::TensorF input({(size_t)batch, (size_t)in_channels, (size_t)in_h, (size_t)in_w});
+    for (size_t i = 0; i < input.numel(); i++) {
+        input.data[i] = 0.01f * (float)(i % 100) - 0.5f;
+    }
+
+    // === Original implementation ===
+    // causal_conv2d: pad_left = kW-1=2, pad_right = stride-1=1, pad_top = kH-1=2, pad_bottom = stride-1=1
+    nemo::TensorF ref_output;
+    nemo::causal_conv2d(input, ref_conv_w->data.data(), out_channels, in_channels,
+                        kH, kW, 2, 2, 1, ref_conv_b->data.data(), ref_output);
+
+    printf("Original output shape: [%zu, %zu, %zu, %zu]\n",
+           ref_output.shape[0], ref_output.shape[1], ref_output.shape[2], ref_output.shape[3]);
+    printf("Original output[0,0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           ref_output(0,0,0,0), ref_output(0,0,0,1), ref_output(0,0,0,2),
+           ref_output(0,0,0,3), ref_output(0,0,0,4));
+
+    // === GGML implementation ===
+    // Need to transpose weights from [OC, IC, KH, KW] to [KW, KH, IC, OC]
+    // And input from [N, C, H, W] to [W, H, C, N]
+
+    size_t buf_size = ggml_tensor_overhead() * 30 + ggml_graph_overhead();
+    std::vector<uint8_t> compute_buf(buf_size);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ buf_size,
+        /*.mem_buffer =*/ compute_buf.data(),
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context * ctx0 = ggml_init(params);
+
+    // Create input tensor in ggml layout [W, H, C, N]
+    struct ggml_tensor * inp = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, in_w, in_h, in_channels, batch);
+    ggml_set_name(inp, "input");
+    ggml_set_input(inp);
+
+    // For weights, we need to use the model's pre-loaded tensor, but it might be in wrong layout
+    // Let me check the ggml tensor dimensions
+    struct ggml_tensor * ggml_w = it_w->second;
+    struct ggml_tensor * ggml_b = it_b->second;
+
+    printf("GGML weight shape: [%lld, %lld, %lld, %lld]\n",
+           (long long)ggml_w->ne[0], (long long)ggml_w->ne[1],
+           (long long)ggml_w->ne[2], (long long)ggml_w->ne[3]);
+
+    // Apply causal padding: pad_left=2, pad_right=1, pad_top=2, pad_bottom=1
+    // ggml_pad_ext(a, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3)
+    // dim0=W, dim1=H, so lp0=pad_left, rp0=pad_right, lp1=pad_top, rp1=pad_bottom
+    struct ggml_tensor * padded = ggml_pad_ext(ctx0, inp, 2, 1, 2, 1, 0, 0, 0, 0);
+
+    // Conv2d with stride=2, padding=0 (we already padded), dilation=1
+    struct ggml_tensor * conv_out = ggml_conv_2d(ctx0, ggml_w, padded, 2, 2, 0, 0, 1, 1);
+
+    // Add bias (need to broadcast)
+    // Bias shape: [out_channels] -> need to reshape for broadcasting
+    struct ggml_tensor * bias_reshaped = ggml_reshape_4d(ctx0, ggml_b, 1, 1, out_channels, 1);
+    struct ggml_tensor * out = ggml_add(ctx0, conv_out, bias_reshaped);
+
+    ggml_set_name(out, "output");
+    ggml_set_output(out);
+
+    // Build graph
+    struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+    ggml_build_forward_expand(gf, out);
+
+    // Allocate
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
+    ggml_gallocr_alloc_graph(allocr, gf);
+
+    // Convert input from [N, C, H, W] to [W, H, C, N]
+    std::vector<float> inp_ggml(input.numel());
+    for (int n = 0; n < batch; n++) {
+        for (int c = 0; c < in_channels; c++) {
+            for (int h = 0; h < in_h; h++) {
+                for (int w = 0; w < in_w; w++) {
+                    // PyTorch: [n, c, h, w]
+                    // ggml: [w, h, c, n]
+                    int src_idx = ((n * in_channels + c) * in_h + h) * in_w + w;
+                    int dst_idx = ((n * in_channels + c) * in_h + h) * in_w + w;  // same for contiguous
+                    inp_ggml[dst_idx] = input.data[src_idx];
+                }
+            }
+        }
+    }
+
+    // Set input
+    ggml_backend_tensor_set(inp, inp_ggml.data(), 0, inp_ggml.size() * sizeof(float));
+
+    // Compute
+    ggml_backend_graph_compute(ctx->model.backend, gf);
+
+    // Get output dimensions
+    printf("GGML output shape: [%lld, %lld, %lld, %lld]\n",
+           (long long)out->ne[0], (long long)out->ne[1],
+           (long long)out->ne[2], (long long)out->ne[3]);
+
+    // Get output
+    size_t out_numel = out->ne[0] * out->ne[1] * out->ne[2] * out->ne[3];
+    std::vector<float> ggml_output(out_numel);
+    ggml_backend_tensor_get(out, ggml_output.data(), 0, out_numel * sizeof(float));
+
+    printf("GGML output[0,0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           ggml_output[0], ggml_output[1], ggml_output[2],
+           ggml_output[3], ggml_output[4]);
+
+    // Compare - need to account for different layouts
+    // ref_output: [N, OC, H_out, W_out] PyTorch
+    // ggml_output: [W_out, H_out, OC, N] ggml
+    float max_diff = 0.0f;
+    int out_h = ref_output.shape[2];
+    int out_w = ref_output.shape[3];
+
+    for (int n = 0; n < batch; n++) {
+        for (int oc = 0; oc < out_channels; oc++) {
+            for (int h = 0; h < out_h; h++) {
+                for (int w = 0; w < out_w; w++) {
+                    // PyTorch idx: [n, oc, h, w]
+                    int ref_idx = ((n * out_channels + oc) * out_h + h) * out_w + w;
+                    // ggml idx: [w, h, oc, n] -> w + h*W + oc*W*H + n*W*H*C
+                    int ggml_idx = w + h * out_w + oc * out_w * out_h + n * out_w * out_h * out_channels;
+
+                    float diff = std::abs(ggml_output[ggml_idx] - ref_output.data[ref_idx]);
+                    max_diff = std::max(max_diff, diff);
+                }
+            }
+        }
+    }
+
+    printf("Max diff: %.6e\n", max_diff);
+
+    // Cleanup
+    ggml_gallocr_free(allocr);
+    ggml_free(ctx0);
+    nemo_free(ctx);
+
+    bool passed = max_diff < 1e-4f;
+    printf("Conv2D test: %s\n\n", passed ? "PASS" : "FAIL");
+    return passed;
+}
+
+// Helper to build causal conv2d: pad + conv2d
+static struct ggml_tensor * build_causal_conv2d(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,   // [W, H, C, N]
+    struct ggml_tensor * weight,  // [KW, KH, IC, OC]
+    struct ggml_tensor * bias,    // [OC]
+    int stride_w, int stride_h
+) {
+    // Causal padding: pad_left = kW-1, pad_right = stride-1, pad_top = kH-1, pad_bottom = stride-1
+    int kW = weight->ne[0];
+    int kH = weight->ne[1];
+    int pad_left = kW - 1;
+    int pad_right = stride_w - 1;
+    int pad_top = kH - 1;
+    int pad_bottom = stride_h - 1;
+
+    struct ggml_tensor * padded = ggml_pad_ext(ctx, input, pad_left, pad_right, pad_top, pad_bottom, 0, 0, 0, 0);
+    struct ggml_tensor * conv_out = ggml_conv_2d(ctx, weight, padded, stride_w, stride_h, 0, 0, 1, 1);
+
+    // Add bias
+    int out_channels = weight->ne[3];
+    struct ggml_tensor * bias_reshaped = ggml_reshape_4d(ctx, bias, 1, 1, out_channels, 1);
+    return ggml_add(ctx, conv_out, bias_reshaped);
+}
+
+// Helper to build causal depthwise conv2d
+// Uses ggml_conv_2d_dw_direct which works with F32 (unlike ggml_conv_2d_dw which uses F16 im2col)
+static struct ggml_tensor * build_causal_dw_conv2d(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,   // [W, H, C, N]
+    struct ggml_tensor * weight,  // [KW, KH, 1, C]
+    struct ggml_tensor * bias,    // [C]
+    int stride_w, int stride_h
+) {
+    int kW = weight->ne[0];
+    int kH = weight->ne[1];
+    int pad_left = kW - 1;
+    int pad_right = stride_w - 1;
+    int pad_top = kH - 1;
+    int pad_bottom = stride_h - 1;
+
+    struct ggml_tensor * padded = ggml_pad_ext(ctx, input, pad_left, pad_right, pad_top, pad_bottom, 0, 0, 0, 0);
+
+    // Use ggml_conv_2d_dw_direct which uses direct F32 computation
+    struct ggml_tensor * conv_out = ggml_conv_2d_dw_direct(ctx, weight, padded, stride_w, stride_h, 0, 0, 1, 1);
+
+    // Add bias
+    int channels = weight->ne[3];
+    struct ggml_tensor * bias_reshaped = ggml_reshape_4d(ctx, bias, 1, 1, channels, 1);
+    return ggml_add(ctx, conv_out, bias_reshaped);
+}
+
+// Test full ConvSubsampling with real mel input
+bool test_conv_subsampling() {
+    printf("=== Testing ConvSubsampling ===\n");
+
+    // Load original weights
+    nemo::ModelWeights ref_weights;
+    if (!ref_weights.load("weights/model.bin")) {
+        fprintf(stderr, "Failed to load reference weights\n");
+        return false;
+    }
+
+    // Load ggml model
+    nemo_context * ctx = nemo_init("weights/model.gguf");
+    if (!ctx) {
+        fprintf(stderr, "Failed to load ggml model\n");
+        return false;
+    }
+
+    // Load mel input from file - raw float32 data, shape [time, 128]
+    FILE * f = fopen("test.mel.bin", "rb");
+    if (!f) {
+        fprintf(stderr, "Failed to open test.mel.bin\n");
+        nemo_free(ctx);
+        return false;
+    }
+
+    // Get file size to determine time dimension
+    fseek(f, 0, SEEK_END);
+    size_t file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    int batch = 1;
+    int features = 128;
+    int time_in = file_size / (sizeof(float) * features);
+
+    printf("Mel input shape: [%d, %d, %d]\n", batch, time_in, features);
+
+    // Read raw float data - file is [time, features]
+    std::vector<float> raw_mel(time_in * features);
+    size_t read = fread(raw_mel.data(), sizeof(float), raw_mel.size(), f);
+    fclose(f);
+
+    if (read != raw_mel.size()) {
+        fprintf(stderr, "Failed to read mel data\n");
+        nemo_free(ctx);
+        return false;
+    }
+
+    // Reshape to [batch, time, features]
+    nemo::TensorF mel_input({(size_t)batch, (size_t)time_in, (size_t)features});
+    for (int t = 0; t < time_in; t++) {
+        for (int f = 0; f < features; f++) {
+            mel_input(0, t, f) = raw_mel[t * features + f];
+        }
+    }
+
+    // === Original implementation ===
+    nemo::ConvSubsampling subsampling;
+    subsampling.load_weights(ref_weights);
+
+    nemo::TensorF ref_output;
+    subsampling.forward(mel_input, ref_output);
+
+    printf("Original output shape: [%zu, %zu, %zu]\n",
+           ref_output.shape[0], ref_output.shape[1], ref_output.shape[2]);
+    printf("Original output[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           ref_output(0,0,0), ref_output(0,0,1), ref_output(0,0,2),
+           ref_output(0,0,3), ref_output(0,0,4));
+
+    // === GGML implementation ===
+    // Get conv weights from model
+    auto get_tensor = [&](const char * name) -> struct ggml_tensor * {
+        auto it = ctx->model.tensors.find(name);
+        return (it != ctx->model.tensors.end()) ? it->second : nullptr;
+    };
+
+    struct ggml_tensor * conv0_w = get_tensor("encoder.pre_encode.conv.0.weight");
+    struct ggml_tensor * conv0_b = get_tensor("encoder.pre_encode.conv.0.bias");
+    struct ggml_tensor * conv2_w = get_tensor("encoder.pre_encode.conv.2.weight");
+    struct ggml_tensor * conv2_b = get_tensor("encoder.pre_encode.conv.2.bias");
+    struct ggml_tensor * conv3_w = get_tensor("encoder.pre_encode.conv.3.weight");
+    struct ggml_tensor * conv3_b = get_tensor("encoder.pre_encode.conv.3.bias");
+    struct ggml_tensor * conv5_w = get_tensor("encoder.pre_encode.conv.5.weight");
+    struct ggml_tensor * conv5_b = get_tensor("encoder.pre_encode.conv.5.bias");
+    struct ggml_tensor * conv6_w = get_tensor("encoder.pre_encode.conv.6.weight");
+    struct ggml_tensor * conv6_b = get_tensor("encoder.pre_encode.conv.6.bias");
+    struct ggml_tensor * out_w = get_tensor("encoder.pre_encode.out.weight");
+    struct ggml_tensor * out_b = get_tensor("encoder.pre_encode.out.bias");
+
+    if (!conv0_w || !conv0_b || !conv2_w || !conv2_b || !conv3_w || !conv3_b ||
+        !conv5_w || !conv5_b || !conv6_w || !conv6_b || !out_w || !out_b) {
+        fprintf(stderr, "Missing ConvSubsampling tensors\n");
+        nemo_free(ctx);
+        return false;
+    }
+
+    // Create compute context - need larger buffer for ConvSubsampling
+    size_t buf_size = ggml_tensor_overhead() * 500 + ggml_graph_overhead();
+    std::vector<uint8_t> compute_buf(buf_size);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ buf_size,
+        /*.mem_buffer =*/ compute_buf.data(),
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context * ctx0 = ggml_init(params);
+
+    // Input: [batch, time, features] -> reshape to [W, H, 1, N] = [features, time, 1, batch]
+    struct ggml_tensor * inp = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, features, time_in, 1, batch);
+    ggml_set_name(inp, "mel_input");
+    ggml_set_input(inp);
+
+    // Conv0: CausalConv2D(1, 256, k=3, s=2) + ReLU
+    struct ggml_tensor * cur = build_causal_conv2d(ctx0, inp, conv0_w, conv0_b, 2, 2);
+    cur = ggml_relu(ctx0, cur);
+
+    // Conv2: Depthwise CausalConv2D(256, k=3, s=2, groups=256)
+    cur = build_causal_dw_conv2d(ctx0, cur, conv2_w, conv2_b, 2, 2);
+
+    // Conv3: Pointwise Conv2d(256, 256, k=1, s=1) + ReLU
+    // Pointwise: no padding needed, stride=1
+    cur = ggml_conv_2d(ctx0, conv3_w, cur, 1, 1, 0, 0, 1, 1);
+    struct ggml_tensor * conv3_b_reshaped = ggml_reshape_4d(ctx0, conv3_b, 1, 1, conv3_b->ne[0], 1);
+    cur = ggml_add(ctx0, cur, conv3_b_reshaped);
+    cur = ggml_relu(ctx0, cur);
+
+    // Conv5: Depthwise CausalConv2D(256, k=3, s=2, groups=256)
+    cur = build_causal_dw_conv2d(ctx0, cur, conv5_w, conv5_b, 2, 2);
+
+    // Conv6: Pointwise Conv2d(256, 256, k=1, s=1) + ReLU
+    cur = ggml_conv_2d(ctx0, conv6_w, cur, 1, 1, 0, 0, 1, 1);
+    struct ggml_tensor * conv6_b_reshaped = ggml_reshape_4d(ctx0, conv6_b, 1, 1, conv6_b->ne[0], 1);
+    cur = ggml_add(ctx0, cur, conv6_b_reshaped);
+    cur = ggml_relu(ctx0, cur);
+
+    // cur shape: [W_out, H_out, 256, batch]
+    // Need to flatten to [256*W_out, H_out, batch] then project to [1024, H_out, batch]
+
+    // Get dimensions
+    // After convs, we expect: W_out = ceil((features+pad)/8) = 17, H_out = ceil((time+pad)/8) = 251
+    // Flatten: [W_out * 256, H_out, batch]
+    int64_t w_out = cur->ne[0];
+    int64_t h_out = cur->ne[1];
+    int64_t c_out = cur->ne[2];
+
+    printf("After conv6+relu: w_out=%lld, h_out=%lld, c_out=%lld\n", w_out, h_out, c_out);
+
+    // Permute from [W, H, C, N] to [C*W, H, N] for linear projection
+    // Original C++ flattens as: flat[c * W + w] = buf[c, t, w]
+    // We need memory order where index i = c*W + w (c varies slower, w faster)
+    // Permute to [W, C, H, N] then reshape to [W*C, H, N] gives i = w + c*W = c*W + w
+    struct ggml_tensor * permuted = ggml_permute(ctx0, cur, 0, 2, 1, 3);  // [W, C, H, N]
+    permuted = ggml_cont(ctx0, permuted);  // Make contiguous
+    permuted = ggml_reshape_3d(ctx0, permuted, w_out * c_out, h_out, batch);  // [W*C, H, N]
+
+    printf("After permute+reshape: [%lld, %lld, %lld]\n",
+           (long long)permuted->ne[0], (long long)permuted->ne[1], (long long)permuted->ne[2]);
+    printf("out_w shape: [%lld, %lld]\n", (long long)out_w->ne[0], (long long)out_w->ne[1]);
+
+    // Linear projection
+    struct ggml_tensor * out = ggml_mul_mat(ctx0, out_w, permuted);
+    // Add bias
+    out = ggml_add(ctx0, out, out_b);
+
+    ggml_set_name(out, "subsampling_output");
+    ggml_set_output(out);
+
+    // Build graph
+    struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+    ggml_build_forward_expand(gf, out);
+
+    // Allocate
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
+    ggml_gallocr_alloc_graph(allocr, gf);
+
+    // Set input (convert from [batch, time, features] to [features, time, 1, batch])
+    std::vector<float> inp_ggml(mel_input.numel());
+    for (int n = 0; n < batch; n++) {
+        for (int t = 0; t < time_in; t++) {
+            for (int f = 0; f < features; f++) {
+                int src_idx = (n * time_in + t) * features + f;
+                int dst_idx = ((n * 1 + 0) * time_in + t) * features + f;
+                inp_ggml[dst_idx] = mel_input.data[src_idx];
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(inp, inp_ggml.data(), 0, inp_ggml.size() * sizeof(float));
+
+    // Compute
+    ggml_backend_graph_compute(ctx->model.backend, gf);
+
+    // Debug: print intermediate shapes
+    printf("After convs, shape: [%lld, %lld, %lld, %lld]\n",
+           (long long)cur->ne[0], (long long)cur->ne[1],
+           (long long)cur->ne[2], (long long)cur->ne[3]);
+    printf("After permute+reshape, shape: [%lld, %lld, %lld]\n",
+           (long long)permuted->ne[0], (long long)permuted->ne[1], (long long)permuted->ne[2]);
+
+    // Get output
+    printf("GGML output shape: [%lld, %lld, %lld]\n",
+           (long long)out->ne[0], (long long)out->ne[1], (long long)out->ne[2]);
+
+    // Check that output has expected number of elements
+    int expected_time = ref_output.shape[1];
+    int expected_features = ref_output.shape[2];
+    printf("Expected output shape: [%d, %d, %zu]\n", batch, expected_time, ref_output.shape[2]);
+
+    size_t out_numel = out->ne[0] * out->ne[1] * out->ne[2];
+    printf("Output numel: %zu\n", out_numel);
+
+    if (out_numel > 10000000) {
+        fprintf(stderr, "Output too large, something wrong with computation\n");
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+        nemo_free(ctx);
+        return false;
+    }
+
+    std::vector<float> ggml_output(out_numel);
+    ggml_backend_tensor_get(out, ggml_output.data(), 0, out_numel * sizeof(float));
+
+    printf("GGML output[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           ggml_output[0], ggml_output[1], ggml_output[2],
+           ggml_output[3], ggml_output[4]);
+
+    // Compare
+    // ref_output: [batch, time_out, 1024]
+    // ggml_output: [1024, time_out, batch]
+    float max_diff = 0.0f;
+    int time_out = ref_output.shape[1];
+    int d_model = ref_output.shape[2];
+
+    for (int n = 0; n < batch; n++) {
+        for (int t = 0; t < time_out; t++) {
+            for (int d = 0; d < d_model; d++) {
+                int ref_idx = (n * time_out + t) * d_model + d;
+                int ggml_idx = (n * time_out + t) * d_model + d;
+
+                float diff = std::abs(ggml_output[ggml_idx] - ref_output.data[ref_idx]);
+                max_diff = std::max(max_diff, diff);
+            }
+        }
+    }
+
+    printf("Max diff: %.6e\n", max_diff);
+
+    // Cleanup
+    ggml_gallocr_free(allocr);
+    ggml_free(ctx0);
+    nemo_free(ctx);
+
+    bool passed = max_diff < 1e-2f;
+    printf("ConvSubsampling test: %s\n\n", passed ? "PASS" : "FAIL");
+    return passed;
+}
+
 int main() {
     printf("=== Testing GGML Computation vs Original ===\n\n");
 
@@ -483,6 +987,8 @@ int main() {
     if (test_layer_norm()) passed++; else failed++;
     if (test_swish()) passed++; else failed++;
     if (test_ffn()) passed++; else failed++;
+    if (test_conv2d()) passed++; else failed++;
+    if (test_conv_subsampling()) passed++; else failed++;
 
     printf("=== Summary ===\n");
     printf("Passed: %d\n", passed);
