@@ -69,41 +69,6 @@ struct nemo_preprocessor {
     std::vector<float> audio_buf;
 };
 
-/*
-// ============================================================================
-// Mel filterbank computation
-// ============================================================================
-
-static float hz_to_mel(float frequency) {
-    // Slaney-style mel scale
-    const float f_min = 0.0f;
-    const float f_sp = 200.0f / 3.0f;
-    const float min_log_hz = 1000.0f;
-    const float min_log_mel = (min_log_hz - f_min) / f_sp;
-    const float logstep = logf(6.4f) / 27.0f;
-
-    float mel = (frequency - f_min) / f_sp;
-    if (frequency >= min_log_hz) {
-        mel = min_log_mel + logf(frequency / min_log_hz) / logstep;
-    }
-    return mel;
-}
-
-static float mel_to_hz(float mel) {
-    const float f_min = 0.0f;
-    const float f_sp = 200.0f / 3.0f;
-    const float min_log_hz = 1000.0f;
-    const float min_log_mel = (min_log_hz - f_min) / f_sp;
-    const float logstep = logf(6.4f) / 27.0f;
-
-    float freq = f_min + f_sp * mel;
-    if (mel >= min_log_mel) {
-        freq = min_log_hz * expf(logstep * (mel - min_log_mel));
-    }
-    return freq;
-}
-*/
-
 // ============================================================================
 // DFT computation
 // ============================================================================

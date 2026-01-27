@@ -422,33 +422,6 @@ static struct ggml_tensor * build_ffn(
     return cur;
 }
 
-/*
-// GLU activation: split input in half, multiply first half by sigmoid of second half
-static struct ggml_tensor * build_glu(
-    struct ggml_context * ctx,
-    struct ggml_tensor * input  // [channels*2, ...]
-) {
-    int64_t half_channels = input->ne[0] / 2;
-    int64_t ne1 = input->ne[1];
-    int64_t ne2 = input->ne[2];
-    int64_t ne3 = input->ne[3];
-
-    // First half
-    struct ggml_tensor * a = ggml_view_4d(ctx, input,
-        half_channels, ne1, ne2, ne3,
-        input->nb[1], input->nb[2], input->nb[3], 0);
-
-    // Second half
-    struct ggml_tensor * b = ggml_view_4d(ctx, input,
-        half_channels, ne1, ne2, ne3,
-        input->nb[1], input->nb[2], input->nb[3],
-        half_channels * ggml_element_size(input));
-
-    // a * sigmoid(b)
-    return ggml_mul(ctx, a, ggml_sigmoid(ctx, b));
-}
-*/
-
 // LSTM cell: returns (h_out, c_out)
 static void build_lstm_cell(
     struct ggml_context * ctx,
@@ -971,26 +944,6 @@ struct ggml_tensor * build_decoder_step(
     return h1_out;  // [hidden_size]
 }
 
-/*
-// Embedding lookup using ggml_get_rows
-// token_id: scalar token ID
-// Returns: [hidden_size] embedding vector
-static struct ggml_tensor * build_embedding_lookup(
-    struct ggml_context * ctx,
-    int token_id,
-    struct ggml_tensor * embedding   // [hidden_size, vocab_size] in GGML layout
-) {
-    // Create index tensor
-    struct ggml_tensor * idx = ggml_new_i32(ctx, token_id);
-
-    // ggml_get_rows expects embedding in [hidden_size, vocab_size] layout
-    // and returns [hidden_size, n_rows]
-    struct ggml_tensor * emb = ggml_get_rows(ctx, embedding, idx);
-
-    // Reshape to [hidden_size]
-    return ggml_reshape_1d(ctx, emb, embedding->ne[0]);
-}
-*/
 // ============================================================================
 // Joint Network
 // ============================================================================
