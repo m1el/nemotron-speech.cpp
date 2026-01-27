@@ -9,6 +9,39 @@
 #include <cmath>
 #include <cstring>
 
+// Helper to accumulate error statistics
+struct error_calc {
+    float max_diff = 0.0f;
+    float sum_diff = 0.0f;
+    float sum_sq_diff = 0.0f;
+    size_t count = 0;
+    void add_array(const float* a, const float* b, size_t n) {
+        for (size_t i = 0; i < n; i++) {
+            add(a[i], b[i]);
+        }
+    }
+    void add(const float a, const float b) {
+        float diff = std::abs(a - b);
+        max_diff = std::max(max_diff, diff);
+        sum_diff += diff;
+        sum_sq_diff += diff * diff;
+        count++;
+    }
+
+    void report(const char* name) const {
+        float mean_diff = count > 0 ? sum_diff / count : 0.0f;
+        float rms_diff = count > 0 ? std::sqrt(sum_sq_diff / count) : 0.0f;
+        printf("%s: max_diff=%.6e, mean_diff=%.6e, rms_diff=%.6e\n", name, max_diff, mean_diff, rms_diff);
+    }
+
+    void reset() {
+        max_diff = 0.0f;
+        sum_diff = 0.0f;
+        sum_sq_diff = 0.0f;
+        count = 0;
+    }
+};
+
 // Test linear projection: output = input @ weight.T
 bool test_linear() {
     printf("=== Testing Linear Projection ===\n");
@@ -113,20 +146,16 @@ bool test_linear() {
            ggml_output[3], ggml_output[4]);
 
     // Compare
-    float max_diff = 0.0f;
-    for (size_t i = 0; i < ref_output.numel(); i++) {
-        float diff = std::abs(ggml_output[i] - ref_output.data[i]);
-        max_diff = std::max(max_diff, diff);
-    }
-
-    printf("Max diff: %.6e\n", max_diff);
+    struct error_calc err;
+    err.add_array(ggml_output.data(), ref_output.data.data(), ref_output.numel());
+    err.report("Linear");
 
     // Cleanup
     ggml_gallocr_free(allocr);
     ggml_free(ctx0);
     nemo_free(ctx);
 
-    bool passed = max_diff < 1e-4f;
+    bool passed = err.max_diff < 1e-4f;
     printf("Linear test: %s\n\n", passed ? "PASS" : "FAIL");
     return passed;
 }
@@ -236,20 +265,16 @@ bool test_layer_norm() {
            ggml_output[3], ggml_output[4]);
 
     // Compare
-    float max_diff = 0.0f;
-    for (size_t i = 0; i < ref_output.numel(); i++) {
-        float diff = std::abs(ggml_output[i] - ref_output.data[i]);
-        max_diff = std::max(max_diff, diff);
-    }
-
-    printf("Max diff: %.6e\n", max_diff);
+    error_calc err;
+    err.add_array(ggml_output.data(), ref_output.data.data(), ref_output.numel());
+    err.report("Layer norm");
 
     // Cleanup
     ggml_gallocr_free(allocr);
     ggml_free(ctx0);
     nemo_free(ctx);
 
-    bool passed = max_diff < 1e-4f;
+    bool passed = err.max_diff < 1e-4f;
     printf("Layer norm test: %s\n\n", passed ? "PASS" : "FAIL");
     return passed;
 }
@@ -326,20 +351,16 @@ bool test_swish() {
            ggml_output[3], ggml_output[4]);
 
     // Compare
-    float max_diff = 0.0f;
-    for (size_t i = 0; i < ref_output.numel(); i++) {
-        float diff = std::abs(ggml_output[i] - ref_output.data[i]);
-        max_diff = std::max(max_diff, diff);
-    }
-
-    printf("Max diff: %.6e\n", max_diff);
+    error_calc err;
+    err.add_array(ggml_output.data(), ref_output.data.data(), ref_output.numel());
+    err.report("Swish");
 
     // Cleanup
     ggml_gallocr_free(allocr);
     ggml_free(ctx0);
     nemo_free(ctx);
 
-    bool passed = max_diff < 1e-5f;
+    bool passed = err.max_diff < 1e-5f;
     printf("Swish test: %s\n\n", passed ? "PASS" : "FAIL");
     return passed;
 }
@@ -455,13 +476,9 @@ bool test_ffn() {
            ggml_output[3], ggml_output[4]);
 
     // Compare
-    float max_diff = 0.0f;
-    for (size_t i = 0; i < ref_output.numel(); i++) {
-        float diff = std::abs(ggml_output[i] - ref_output.data[i]);
-        max_diff = std::max(max_diff, diff);
-    }
-
-    printf("Max diff: %.6e\n", max_diff);
+    error_calc err;
+    err.add_array(ggml_output.data(), ref_output.data.data(), ref_output.numel());
+    err.report("FFN");
 
     // Cleanup
     ggml_gallocr_free(allocr);
@@ -470,7 +487,7 @@ bool test_ffn() {
 
     // FFN has 3 chained operations with large intermediate values
     // Use a looser threshold (1e-2) but still verify relative error is small
-    bool passed = max_diff < 1e-2f;
+    bool passed = err.max_diff < 1e-2f;
     printf("FFN test: %s\n\n", passed ? "PASS" : "FAIL");
     return passed;
 }
@@ -636,7 +653,7 @@ bool test_conv2d() {
     // Compare - need to account for different layouts
     // ref_output: [N, OC, H_out, W_out] PyTorch
     // ggml_output: [W_out, H_out, OC, N] ggml
-    float max_diff = 0.0f;
+    error_calc err;
     size_t out_h = ref_output.shape[2];
     size_t out_w = ref_output.shape[3];
 
@@ -649,21 +666,20 @@ bool test_conv2d() {
                     // ggml idx: [w, h, oc, n] -> w + h*W + oc*W*H + n*W*H*C
                     size_t ggml_idx = w + h * out_w + oc * out_w * out_h + n * out_w * out_h * out_channels;
 
-                    float diff = std::abs(ggml_output[ggml_idx] - ref_output.data[ref_idx]);
-                    max_diff = std::max(max_diff, diff);
+                    err.add(ggml_output[ggml_idx], ref_output.data[ref_idx]);
                 }
             }
         }
     }
 
-    printf("Max diff: %.6e\n", max_diff);
+    err.report("Conv2D");
 
     // Cleanup
     ggml_gallocr_free(allocr);
     ggml_free(ctx0);
     nemo_free(ctx);
 
-    bool passed = max_diff < 1e-4f;
+    bool passed = err.max_diff < 1e-4f;
     printf("Conv2D test: %s\n\n", passed ? "PASS" : "FAIL");
     return passed;
 }
@@ -950,7 +966,7 @@ bool test_conv_subsampling() {
     // Compare
     // ref_output: [batch, time_out, 1024]
     // ggml_output: [1024, time_out, batch]
-    float max_diff = 0.0f;
+    struct error_calc err;
     size_t time_out = ref_output.shape[1];
     size_t d_model = ref_output.shape[2];
 
@@ -960,20 +976,19 @@ bool test_conv_subsampling() {
                 size_t ref_idx = (n * time_out + t) * d_model + d;
                 size_t ggml_idx = (n * time_out + t) * d_model + d;
 
-                float diff = std::abs(ggml_output[ggml_idx] - ref_output.data[ref_idx]);
-                max_diff = std::max(max_diff, diff);
+                err.add(ggml_output[ggml_idx], ref_output.data[ref_idx]);
             }
         }
     }
 
-    printf("Max diff: %.6e\n", max_diff);
+    err.report("ConvSubsampling");
 
     // Cleanup
     ggml_gallocr_free(allocr);
     ggml_free(ctx0);
     nemo_free(ctx);
 
-    bool passed = max_diff < 1e-2f;
+    bool passed = err.max_diff < 1e-2f;
     printf("ConvSubsampling test: %s\n\n", passed ? "PASS" : "FAIL");
     return passed;
 }
@@ -1167,19 +1182,15 @@ bool test_mha() {
     printf("GGML Q[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
            ggml_q[0], ggml_q[1], ggml_q[2], ggml_q[3], ggml_q[4]);
 
-    float max_diff = 0.0f;
-    for (size_t i = 0; i < ref_q.numel(); i++) {
-        float diff = std::abs(ggml_q[i] - ref_q.data[i]);
-        max_diff = std::max(max_diff, diff);
-    }
-
-    printf("Q projection max diff: %.6e\n", max_diff);
+    error_calc err;
+    err.add_array(ggml_q.data(), ref_q.data.data(), ref_q.numel());
+    err.report("MHA Q projection");
 
     ggml_gallocr_free(allocr);
     ggml_free(ctx0);
     nemo_free(ctx);
 
-    bool passed = max_diff < 1e-4f;
+    bool passed = err.max_diff < 1e-4f;
     printf("MHA Q projection test: %s\n\n", passed ? "PASS" : "FAIL");
     return passed;
 }
@@ -1260,7 +1271,7 @@ bool test_pos_encoding() {
            ggml_pos_data[ggml_idx * d_model + 4]);
 
     // Compare
-    float max_diff = 0.0f;
+    struct error_calc err;
     int ref_len = ref_pos.shape[0];  // 2*max_len-1
 
     for (int i = 0; i < ref_len && i < total_len; i++) {
@@ -1271,16 +1282,15 @@ bool test_pos_encoding() {
         for (int d = 0; d < d_model; d++) {
             float ref_val = ref_pos(i, d);
             float ggml_val = ggml_pos_data[ggml_pos_idx * d_model + d];
-            float diff = std::abs(ref_val - ggml_val);
-            max_diff = std::max(max_diff, diff);
+            err.add(ggml_val, ref_val);
         }
     }
 
-    printf("Max diff: %.6e\n", max_diff);
+    err.report("Positional Encoding");
 
     nemo_free(ctx);
 
-    bool passed = max_diff < 1e-5f;
+    bool passed = err.max_diff < 1e-5f;
     printf("Positional encoding test: %s\n\n", passed ? "PASS" : "FAIL");
     return passed;
 }
@@ -1565,19 +1575,18 @@ bool test_conformer_conv() {
            orig_after_glu(0,0,3), orig_after_glu(0,0,4));
 
     // Compare GLU outputs
-    float glu_max_diff = 0.0f;
+    struct error_calc err;
     for (size_t b = 0; b < batch; b++) {
         for (size_t t = 0; t < seq_len; t++) {
             for (size_t d = 0; d < d_model; d++) {
                 float ref_val = orig_after_glu(b, t, d);
                 // GGML GLU: [d_model, seq_len, batch] -> index = d + t*d_model + b*d_model*seq_len
                 float ggml_val = ggml_glu[d + t * d_model + b * d_model * seq_len];
-                float diff = std::abs(ref_val - ggml_val);
-                glu_max_diff = std::max(glu_max_diff, diff);
+                err.add(ggml_val, ref_val);
             }
         }
     }
-    printf("GLU max diff: %.6e\n", glu_max_diff);
+    err.report("GLU");
 
     // Compute original depthwise conv output
     // Transpose GLU output to [batch, d_model, time] for causal_conv1d
@@ -1610,19 +1619,18 @@ bool test_conformer_conv() {
     // Compare dw outputs
     // orig_after_dw: [batch, d_model, time]
     // ggml_dw: [d_model, seq_len, batch]
-    float dw_max_diff = 0.0f;
+    struct error_calc err_dw;
     for (size_t b = 0; b < batch; b++) {
         for (size_t t = 0; t < seq_len; t++) {
             for (size_t d = 0; d < d_model; d++) {
                 float ref_val = orig_after_dw(b, d, t);
                 // GGML dw: [d_model, seq_len, batch] -> index = d + t*d_model + b*d_model*seq_len
                 float ggml_val = ggml_dw[d + t * d_model + b * d_model * seq_len];
-                float diff = std::abs(ref_val - ggml_val);
-                dw_max_diff = std::max(dw_max_diff, diff);
+                err_dw.add(ggml_val, ref_val);
             }
         }
     }
-    printf("Depthwise conv max diff: %.6e\n", dw_max_diff);
+    err_dw.report("Depthwise Conv");
 
     // Get full conv module output
     // out: [seq_len, d_model, batch] after final permute
@@ -1635,7 +1643,7 @@ bool test_conformer_conv() {
     // Compare with original output (ref_output is already computed above)
     // ref_output: [batch, time, d_model]
     // ggml_out: [seq_len, d_model, batch] -> index = t + d*seq_len + b*seq_len*d_model
-    float max_diff = 0.0f;
+    struct error_calc err_conv;
     for (size_t b = 0; b < batch; b++) {
         for (size_t t = 0; t < seq_len; t++) {
             for (size_t d = 0; d < d_model; d++) {
@@ -1643,20 +1651,19 @@ bool test_conformer_conv() {
                 float ref_val = ref_output(b, t, d);
                 // ggml_out: [seq_len, d_model, batch] -> index = t + d*seq_len + b*seq_len*d_model
                 float ggml_val = ggml_out[t + d * seq_len + b * seq_len * d_model];
-                float diff = std::abs(ref_val - ggml_val);
-                max_diff = std::max(max_diff, diff);
+                err_conv.add(ggml_val, ref_val);
             }
         }
     }
 
-    printf("Conv module max diff: %.6e\n", max_diff);
+    err_conv.report("Conformer Conv Module Output");
 
     // Cleanup
     ggml_gallocr_free(allocr);
     ggml_free(ctx0);
     nemo_free(ctx);
 
-    bool passed = max_diff < 1e-2f;  // Allow larger diff for multi-step computation
+    bool passed = err_conv.max_diff < 1e-2f;  // Allow larger diff for multi-step computation
     printf("Conformer Conv module test: %s\n\n", passed ? "PASS" : "FAIL");
     return passed;
 }
@@ -1681,19 +1688,22 @@ static TestEntry tests[] = {
 };
 
 int main(int argc, char ** argv) {
-    const char * filter = nullptr;
-    if (argc > 1) {
-        filter = argv[1];
-    }
-
     printf("=== Testing GGML Computation vs Original ===\n\n");
 
     int passed = 0;
     int failed = 0;
     int skipped = 0;
 
+    bool no_filter = argc <= 1;
     for (int i = 0; tests[i].name != nullptr; i++) {
-        if (filter && strcmp(filter, tests[i].name) != 0) {
+        bool run_test = no_filter;
+        for (int jj = 1; jj < argc; jj++) {
+            if (strcmp(tests[i].name, argv[jj]) == 0) {
+                run_test = true;
+                break;
+            }
+        }
+        if (!run_test) {
             skipped++;
             continue;
         }
