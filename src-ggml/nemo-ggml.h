@@ -26,15 +26,31 @@ struct nemo_hparams {
     float   eps         = 1e-5f;  // layer norm epsilon
 };
 
-// ConvSubsampling weights
+// ConvSubsampling weights (depthwise-separable architecture)
 struct nemo_conv_subsampling {
-    struct ggml_tensor * conv1_w;   // [256, 1, 3, 3]
-    struct ggml_tensor * conv1_b;   // [256]
-    struct ggml_tensor * conv2_w;   // [256, 256, 3, 3]
+    // Conv0: CausalConv2D(1, 256, k=3, s=2) + ReLU
+    struct ggml_tensor * conv0_w;   // [3, 3, 1, 256]
+    struct ggml_tensor * conv0_b;   // [256]
+
+    // Conv2: Depthwise CausalConv2D(256, k=3, s=2, groups=256)
+    struct ggml_tensor * conv2_w;   // [3, 3, 1, 256]
     struct ggml_tensor * conv2_b;   // [256]
-    struct ggml_tensor * conv3_w;   // [256, 256, 3, 3]
+
+    // Conv3: Pointwise Conv2D(256, 256, k=1, s=1) + ReLU
+    struct ggml_tensor * conv3_w;   // [1, 1, 256, 256]
     struct ggml_tensor * conv3_b;   // [256]
-    struct ggml_tensor * out_w;     // [1024, 2048]
+
+    // Conv5: Depthwise CausalConv2D(256, k=3, s=2, groups=256)
+    struct ggml_tensor * conv5_w;   // [3, 3, 1, 256]
+    struct ggml_tensor * conv5_b;   // [256]
+
+    // Conv6: Pointwise Conv2D(256, 256, k=1, s=1) + ReLU
+    struct ggml_tensor * conv6_w;   // [1, 1, 256, 256]
+    struct ggml_tensor * conv6_b;   // [256]
+
+    // Output projection
+    struct ggml_tensor * out_w;     // [1024, flat_dim]
+    struct ggml_tensor * out_b;     // [1024]
 };
 
 // Conformer layer weights
@@ -192,6 +208,24 @@ struct ggml_tensor * build_conformer_layer(
     int n_heads,
     int d_head,
     int kernel_size);
+
+// Build ConvSubsampling: mel -> subsampled features
+// mel: [n_mels, time, batch]
+// Returns: [d_model, time/8, batch]
+struct ggml_tensor * build_conv_subsampling(
+    struct ggml_context * ctx,
+    struct ggml_tensor * mel,           // [n_mels, time, batch]
+    nemo_conv_subsampling * subsampling // weights
+);
+
+// Build full encoder: ConvSubsampling + 24 Conformer layers
+// mel: [n_mels, time, batch]
+// Returns: [d_model, time/8, batch]
+struct ggml_tensor * build_encoder(
+    struct ggml_context * ctx,
+    struct ggml_tensor * mel,       // [n_mels, time, batch]
+    nemo_model * model              // model with all weights
+);
 
 // Run inference
 std::vector<int> nemo_encode(

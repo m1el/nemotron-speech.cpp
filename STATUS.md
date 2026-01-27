@@ -1,6 +1,6 @@
 # Implementation Status
 
-**Last Updated**: 2026-01-27
+**Last Updated**: 2025-01-27
 
 ## Current State: GGML Port In Progress
 
@@ -8,7 +8,7 @@
 
 The C++ port of NVIDIA's NeMo ASR model (nemotron-speech-streaming-en-0.6b) is fully functional and produces correct transcriptions.
 
-### GGML Port: Phase 7 Complete
+### GGML Port: Phase 8 Complete
 
 #### Phase 1: Infrastructure (COMPLETE)
 - GGUF conversion script: `scripts/convert_to_gguf.py`
@@ -92,11 +92,35 @@ New functions added:
 - `build_conformer_conv()`: Encapsulates conv module (pointwise1 + GLU + depthwise + LN + Swish + pointwise2)
 - `build_conformer_layer()`: Full layer with all residual paths
 
-#### Remaining Phases:
-- Phase 8: Full Encoder (24 layers + subsampling)
-- Phase 9-12: Decoder, joint, greedy decode
+#### Phase 8: Full Encoder (COMPLETE)
+| Test | Status | Max Diff |
+|------|--------|----------|
+| Full Encoder (24 layers) | PASS | 4.5e-05 |
 
-### Test Summary (12/12 PASS)
+Key implementation notes:
+- `build_conv_subsampling()`: Depthwise-separable subsampling with 6 conv layers
+- `build_encoder()`: Full encoder graph (ConvSubsampling + 24 Conformer layers)
+- Positional encoding: Stored in NeMo descending order for direct slicing
+- 3214 graph nodes for full encoder
+- Reference output precomputed to avoid 2-minute CPU time per test
+
+Conv layer structure (depthwise-separable):
+- conv.0: Standard 2D conv [256, 1, 3, 3]
+- conv.2 + conv.3: Depthwise [256, 1, 3, 3] + Pointwise [256, 256, 1, 1]
+- conv.5 + conv.6: Depthwise [256, 1, 3, 3] + Pointwise [256, 256, 1, 1]
+- out: Linear projection [4352 → 1024]
+
+Fixed bugs:
+- Positional embedding storage order (was ascending, now descending to match NeMo)
+- Kernel size inference from weight tensor (was defaulting to 31, now correctly infers 9)
+
+#### Remaining Phases:
+- Phase 9: RNNT Decoder (LSTM)
+- Phase 10: Joint Network
+- Phase 11: Greedy Decode
+- Phase 12: Full Pipeline
+
+### Test Summary (13/13 PASS)
 ```
 linear          PASS  (2.3e-05)
 layer_norm      PASS  (1.7e-06)
@@ -110,6 +134,7 @@ mha             PASS  (5.7e-06)
 mha_full        PASS  (7.8e-04)
 conformer_conv  PASS  (8.9e-04)
 conformer_layer PASS  (2.4e-04)
+encoder         PASS  (4.5e-05)
 ```
 
 ### File Structure
@@ -121,12 +146,13 @@ nemotron-speech.cpp/
 │   └── nemo-ggml.cpp        # Weight loading + graph builders
 ├── tests-ggml/              # Verification tests
 │   ├── test_weights.cpp     # Weight loading verification (PASS)
-│   └── test_compute.cpp     # Computation verification (12/12 PASS)
+│   └── test_compute.cpp     # Computation verification (13/13 PASS)
 ├── scripts/
 │   └── convert_to_gguf.py   # Converts model.bin to model.gguf
 ├── weights/
 │   ├── model.bin            # Original binary weights
-│   └── model.gguf           # GGUF format weights (2.3GB)
+│   ├── model.gguf           # GGUF format weights (2.3GB)
+│   └── encoder_ref.bin      # Precomputed encoder reference output
 └── Makefile.ggml            # Build system for ggml tests
 ```
 

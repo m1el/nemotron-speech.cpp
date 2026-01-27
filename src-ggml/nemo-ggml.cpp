@@ -9,11 +9,14 @@
 #define NEMO_MAX_NODES 8192
 
 // Compute positional embeddings (sinusoidal)
+// NeMo convention: pos[0] = most positive position, pos[total_len-1] = most negative
+// i.e., stored in descending order: +max_len-1, +max_len-2, ..., 0, ..., -(max_len-1)
 static void compute_pos_emb(float * data, int max_len, int d_model) {
     int total_len = 2 * max_len - 1;
 
     for (int pos = 0; pos < total_len; pos++) {
-        float p = (float)pos - (float)(max_len - 1);
+        // Reversed: p goes from +(max_len-1) down to -(max_len-1)
+        float p = (float)(max_len - 1) - (float)pos;
 
         for (int i = 0; i < d_model; i += 2) {
             float div_term = std::exp(-(float)i * std::log(10000.0f) / (float)d_model);
@@ -198,13 +201,18 @@ bool nemo_model_load(const std::string & path, nemo_model & model) {
 
     // Map tensors to model structure
     // ConvSubsampling
-    model.encoder.subsampling.conv1_w = model.tensors["encoder.pre_encode.conv.0.weight"];
-    model.encoder.subsampling.conv1_b = model.tensors["encoder.pre_encode.conv.0.bias"];
+    model.encoder.subsampling.conv0_w = model.tensors["encoder.pre_encode.conv.0.weight"];
+    model.encoder.subsampling.conv0_b = model.tensors["encoder.pre_encode.conv.0.bias"];
     model.encoder.subsampling.conv2_w = model.tensors["encoder.pre_encode.conv.2.weight"];
     model.encoder.subsampling.conv2_b = model.tensors["encoder.pre_encode.conv.2.bias"];
-    model.encoder.subsampling.conv3_w = model.tensors["encoder.pre_encode.conv.4.weight"];
-    model.encoder.subsampling.conv3_b = model.tensors["encoder.pre_encode.conv.4.bias"];
+    model.encoder.subsampling.conv3_w = model.tensors["encoder.pre_encode.conv.3.weight"];
+    model.encoder.subsampling.conv3_b = model.tensors["encoder.pre_encode.conv.3.bias"];
+    model.encoder.subsampling.conv5_w = model.tensors["encoder.pre_encode.conv.5.weight"];
+    model.encoder.subsampling.conv5_b = model.tensors["encoder.pre_encode.conv.5.bias"];
+    model.encoder.subsampling.conv6_w = model.tensors["encoder.pre_encode.conv.6.weight"];
+    model.encoder.subsampling.conv6_b = model.tensors["encoder.pre_encode.conv.6.bias"];
     model.encoder.subsampling.out_w   = model.tensors["encoder.pre_encode.out.weight"];
+    model.encoder.subsampling.out_b   = model.tensors["encoder.pre_encode.out.bias"];
 
     // Encoder layers
     for (int i = 0; i < model.hparams.n_layers; i++) {
@@ -241,6 +249,12 @@ bool nemo_model_load(const std::string & path, nemo_model & model) {
 
         layer.norm_final_w = model.tensors[prefix + ".norm_out.weight"];
         layer.norm_final_b = model.tensors[prefix + ".norm_out.bias"];
+
+        // Infer kernel_size from first layer's depthwise conv weight
+        if (i == 0 && layer.conv_dw_w) {
+            // Weight shape in GGML is [kernel_size, 1, d_model]
+            model.hparams.kernel_size = layer.conv_dw_w->ne[0];
+        }
     }
 
     // Encoder final (note: this model doesn't have separate final norm or fc after conformer layers)
@@ -276,7 +290,7 @@ bool nemo_model_load(const std::string & path, nemo_model & model) {
         }
     };
 
-    check(model.encoder.subsampling.conv1_w, "encoder.pre_encode.conv.0.weight");
+    check(model.encoder.subsampling.conv0_w, "encoder.pre_encode.conv.0.weight");
     check(model.encoder.subsampling.out_w, "encoder.pre_encode.out.weight");
     check(model.decoder.embedding, "decoder.prediction.embed.weight");
     check(model.joint.out_w, "joint.joint_net.2.weight");
@@ -513,6 +527,7 @@ static struct ggml_tensor * build_rel_pos_mha(
     pos = ggml_cont(ctx, ggml_permute(ctx, pos, 0, 2, 1, 3));  // [d_head, pos_len, heads, 1]
 
     // Reshape bias_u, bias_v to [d_head, 1, heads, 1] for broadcasting
+    // bias_u/v is stored as [d_head, heads] in GGML, reshape to [d_head, 1, heads, 1]
     struct ggml_tensor * bias_u_4d = ggml_reshape_4d(ctx, bias_u, d_head, 1, n_heads, 1);
     struct ggml_tensor * bias_v_4d = ggml_reshape_4d(ctx, bias_v, d_head, 1, n_heads, 1);
 
@@ -696,4 +711,160 @@ struct ggml_tensor * build_conformer_layer(
     cur = build_layer_norm(ctx, residual, layer->norm_final_w, layer->norm_final_b);
 
     return cur;
+}
+
+// ============================================================================
+// ConvSubsampling
+// ============================================================================
+
+// Helper: build causal conv2d with asymmetric padding
+static struct ggml_tensor * build_causal_conv2d(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,   // [W, H, C, N]
+    struct ggml_tensor * weight,  // [KW, KH, IC, OC]
+    struct ggml_tensor * bias,    // [OC]
+    int stride_w, int stride_h
+) {
+    // Causal padding: pad_left = kW-1, pad_right = stride-1, pad_top = kH-1, pad_bottom = stride-1
+    int kW = weight->ne[0];
+    int kH = weight->ne[1];
+    int pad_left = kW - 1;
+    int pad_right = stride_w - 1;
+    int pad_top = kH - 1;
+    int pad_bottom = stride_h - 1;
+
+    struct ggml_tensor * padded = ggml_pad_ext(ctx, input, pad_left, pad_right, pad_top, pad_bottom, 0, 0, 0, 0);
+    struct ggml_tensor * conv_out = ggml_conv_2d(ctx, weight, padded, stride_w, stride_h, 0, 0, 1, 1);
+
+    // Add bias
+    int out_channels = weight->ne[3];
+    struct ggml_tensor * bias_reshaped = ggml_reshape_4d(ctx, bias, 1, 1, out_channels, 1);
+    return ggml_add(ctx, conv_out, bias_reshaped);
+}
+
+// Helper: build causal depthwise conv2d using ggml_conv_2d_dw_direct (F32)
+static struct ggml_tensor * build_causal_dw_conv2d(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,   // [W, H, C, N]
+    struct ggml_tensor * weight,  // [KW, KH, 1, C]
+    struct ggml_tensor * bias,    // [C]
+    int stride_w, int stride_h
+) {
+    int kW = weight->ne[0];
+    int kH = weight->ne[1];
+    int pad_left = kW - 1;
+    int pad_right = stride_w - 1;
+    int pad_top = kH - 1;
+    int pad_bottom = stride_h - 1;
+
+    struct ggml_tensor * padded = ggml_pad_ext(ctx, input, pad_left, pad_right, pad_top, pad_bottom, 0, 0, 0, 0);
+    struct ggml_tensor * conv_out = ggml_conv_2d_dw_direct(ctx, weight, padded, stride_w, stride_h, 0, 0, 1, 1);
+
+    // Add bias
+    int channels = weight->ne[3];
+    struct ggml_tensor * bias_reshaped = ggml_reshape_4d(ctx, bias, 1, 1, channels, 1);
+    return ggml_add(ctx, conv_out, bias_reshaped);
+}
+
+// Build ConvSubsampling module (depthwise-separable architecture)
+// mel: [n_mels, time, batch] -> [d_model, time/8, batch]
+struct ggml_tensor * build_conv_subsampling(
+    struct ggml_context * ctx,
+    struct ggml_tensor * mel,           // [n_mels, time, batch]
+    nemo_conv_subsampling * sub         // weights
+) {
+    int64_t n_mels = mel->ne[0];
+    int64_t time_in = mel->ne[1];
+    int64_t batch = mel->ne[2];
+
+    // Reshape to 4D for conv2d: [n_mels, time, 1, batch]
+    struct ggml_tensor * cur = ggml_reshape_4d(ctx, mel, n_mels, time_in, 1, batch);
+
+    // Conv0: CausalConv2D(1, 256, k=3, s=2) + ReLU
+    cur = build_causal_conv2d(ctx, cur, sub->conv0_w, sub->conv0_b, 2, 2);
+    cur = ggml_relu(ctx, cur);
+
+    // Conv2: Depthwise CausalConv2D(256, k=3, s=2, groups=256)
+    cur = build_causal_dw_conv2d(ctx, cur, sub->conv2_w, sub->conv2_b, 2, 2);
+
+    // Conv3: Pointwise Conv2D(256, 256, k=1, s=1) + ReLU
+    cur = ggml_conv_2d(ctx, sub->conv3_w, cur, 1, 1, 0, 0, 1, 1);
+    struct ggml_tensor * conv3_b_reshaped = ggml_reshape_4d(ctx, sub->conv3_b, 1, 1, sub->conv3_b->ne[0], 1);
+    cur = ggml_add(ctx, cur, conv3_b_reshaped);
+    cur = ggml_relu(ctx, cur);
+
+    // Conv5: Depthwise CausalConv2D(256, k=3, s=2, groups=256)
+    cur = build_causal_dw_conv2d(ctx, cur, sub->conv5_w, sub->conv5_b, 2, 2);
+
+    // Conv6: Pointwise Conv2D(256, 256, k=1, s=1) + ReLU
+    cur = ggml_conv_2d(ctx, sub->conv6_w, cur, 1, 1, 0, 0, 1, 1);
+    struct ggml_tensor * conv6_b_reshaped = ggml_reshape_4d(ctx, sub->conv6_b, 1, 1, sub->conv6_b->ne[0], 1);
+    cur = ggml_add(ctx, cur, conv6_b_reshaped);
+    cur = ggml_relu(ctx, cur);
+
+    // cur shape: [W_out, H_out, 256, batch] where W_out ~= n_mels/8, H_out ~= time/8
+    int64_t w_out = cur->ne[0];  // ~17 for n_mels=128
+    int64_t h_out = cur->ne[1];  // ~time/8
+    int64_t c_out = cur->ne[2];  // 256
+
+    // Permute to [W, C, H, N] then reshape to [W*C, H, N] for linear projection
+    // This matches original C++ flatten order: flat[c * W + w]
+    struct ggml_tensor * permuted = ggml_cont(ctx, ggml_permute(ctx, cur, 0, 2, 1, 3));
+    permuted = ggml_reshape_3d(ctx, permuted, w_out * c_out, h_out, batch);
+
+    // Linear projection: [W*C, H, N] -> [d_model, H, N]
+    cur = ggml_mul_mat(ctx, sub->out_w, permuted);
+
+    // Add bias
+    cur = ggml_add(ctx, cur, sub->out_b);
+
+    return cur;  // [d_model, time_out, batch]
+}
+
+// ============================================================================
+// Full Encoder
+// ============================================================================
+
+// Build full encoder: ConvSubsampling + 24 Conformer layers
+// mel: [n_mels, time, batch]
+// Returns: [d_model, time/8, batch]
+struct ggml_tensor * build_encoder(
+    struct ggml_context * ctx,
+    struct ggml_tensor * mel,       // [n_mels, time, batch]
+    nemo_model * model              // model with all weights
+) {
+    const int n_heads = model->hparams.n_heads;     // 8
+    const int d_head = model->hparams.d_head;       // 128
+    const int kernel_size = model->hparams.kernel_size;  // 31
+    const int n_layers = model->hparams.n_layers;   // 24
+    const int d_model = model->hparams.d_model;     // 1024
+
+    // 1. ConvSubsampling: [n_mels, time, batch] -> [d_model, time/8, batch]
+    struct ggml_tensor * cur = build_conv_subsampling(ctx, mel, &model->encoder.subsampling);
+
+    int64_t seq_len = cur->ne[1];  // time/8
+    int64_t batch = cur->ne[2];
+
+    // 2. Get positional embeddings for this sequence length
+    // pos_emb is precomputed as [d_model, 2*max_len-1], we need to slice for current seq_len
+    // pos_len needed = 2*seq_len - 1
+    int64_t pos_len = 2 * seq_len - 1;
+    int64_t max_pos_len = model->pos_emb->ne[1];  // 2*512-1 = 1023
+
+    // Calculate offset to center the slice (for positions [-(seq_len-1), seq_len-1])
+    int64_t pos_offset = (max_pos_len - pos_len) / 2;
+
+    struct ggml_tensor * pos_emb = ggml_view_2d(ctx, model->pos_emb,
+        d_model, pos_len,
+        model->pos_emb->nb[1],
+        pos_offset * model->pos_emb->nb[1]);
+
+    // 3. Process through all conformer layers
+    for (int i = 0; i < n_layers; i++) {
+        cur = build_conformer_layer(ctx, cur, pos_emb,
+                                    &model->encoder.layers[i],
+                                    n_heads, d_head, kernel_size);
+    }
+
+    return cur;  // [d_model, time/8, batch]
 }

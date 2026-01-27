@@ -1316,8 +1316,11 @@ bool test_pos_encoding() {
     printf("Sample ref_pos[0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
            ref_pos(0, 0), ref_pos(0, 1), ref_pos(0, 2), ref_pos(0, 3), ref_pos(0, 4));
 
-    // For i=0 (position max_len-1), ggml pos = 2*(max_len-1) - 0 = 2*max_len-2 = total_len-1
-    int ggml_idx = total_len - 1;
+    // With the new GGML convention:
+    // ggml_pos_data[i] stores position (max_len - 1 - i), i.e., descending from +(max_len-1) to -(max_len-1)
+    // ref_pos(i, d) stores embedding for position (max_len - 1 - i)
+    // So ref_pos[i] corresponds to ggml_pos[i] - they're in the same order!
+    int ggml_idx = 0;  // position max_len-1 is at index 0 in GGML
     printf("Sample ggml_pos[pos=%d,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
            ggml_idx,
            ggml_pos_data[ggml_idx * d_model + 0],
@@ -1331,9 +1334,8 @@ bool test_pos_encoding() {
     int ref_len = ref_pos.shape[0];  // 2*max_len-1
 
     for (int i = 0; i < ref_len && i < total_len; i++) {
-        // ref_pos position = max_len - 1 - i
-        // ggml_pos index = 2*(max_len-1) - i = total_len - 1 - i
-        int ggml_pos_idx = total_len - 1 - i;
+        // Both ref_pos and ggml_pos now store in same order (descending positions)
+        int ggml_pos_idx = i;
 
         for (int d = 0; d < d_model; d++) {
             float ref_val = ref_pos(i, d);
@@ -2145,6 +2147,204 @@ bool test_conformer_layer() {
     return passed;
 }
 
+// Test full encoder (ConvSubsampling + 24 Conformer layers)
+bool test_encoder() {
+    printf("=== Testing Full Encoder ===\n");
+
+    // Load ggml model
+    nemo_context * ctx = nemo_init("weights/model.gguf");
+    if (!ctx) {
+        fprintf(stderr, "Failed to load ggml model\n");
+        return false;
+    }
+
+    // Load mel input from file - raw float32 data, shape [time, 128]
+    FILE * f = fopen("test.mel.bin", "rb");
+    if (!f) {
+        fprintf(stderr, "Failed to open test.mel.bin\n");
+        nemo_free(ctx);
+        return false;
+    }
+
+    // Get file size to determine time dimension
+    fseek(f, 0, SEEK_END);
+    size_t file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    size_t batch = 1;
+    size_t features = 128;
+    size_t time_in = file_size / (sizeof(float) * features);
+
+    printf("Mel input shape: [%zu, %zu, %zu]\n", batch, time_in, features);
+
+    // Read raw float data - file is [time, features]
+    std::vector<float> raw_mel(time_in * features);
+    size_t read = fread(raw_mel.data(), sizeof(float), raw_mel.size(), f);
+    fclose(f);
+
+    if (read != raw_mel.size()) {
+        fprintf(stderr, "Failed to read mel data\n");
+        nemo_free(ctx);
+        return false;
+    }
+
+    // Reshape to [batch, time, features]
+    nemo::TensorF mel_input({batch, time_in, features});
+    for (size_t t = 0; t < time_in; t++) {
+        for (size_t ff = 0; ff < features; ff++) {
+            mel_input(0, t, ff) = raw_mel[t * features + ff];
+        }
+    }
+
+    // Load precomputed reference output
+    // If not available, fall back to computing it (slow)
+    nemo::TensorF ref_output;
+    FILE * ref_file = fopen("weights/encoder_ref.bin", "rb");
+    if (ref_file) {
+        printf("Loading precomputed reference from weights/encoder_ref.bin\n");
+        uint64_t shape[3];
+        if (fread(shape, sizeof(uint64_t), 3, ref_file) != 3) {
+            fprintf(stderr, "Failed to read reference shape\n");
+            fclose(ref_file);
+            nemo_free(ctx);
+            return false;
+        }
+        ref_output.resize({(size_t)shape[0], (size_t)shape[1], (size_t)shape[2]});
+        if (fread(ref_output.data.data(), sizeof(float), ref_output.numel(), ref_file) != ref_output.numel()) {
+            fprintf(stderr, "Failed to read reference data\n");
+            fclose(ref_file);
+            nemo_free(ctx);
+            return false;
+        }
+        fclose(ref_file);
+    } else {
+        printf("No precomputed reference found, computing (this may take a while)...\n");
+        printf("Run: make -f Makefile.ggml precompute_encoder_ref && ./precompute_encoder_ref\n");
+
+        // Load original weights
+        nemo::ModelWeights ref_weights;
+        if (!ref_weights.load("weights/model.bin")) {
+            fprintf(stderr, "Failed to load reference weights\n");
+            nemo_free(ctx);
+            return false;
+        }
+
+        nemo::ConformerEncoder encoder_ref;
+        encoder_ref.load_weights(ref_weights);
+        encoder_ref.forward(mel_input, ref_output);
+    }
+
+    printf("Reference encoder output shape: [%zu, %zu, %zu]\n",
+           ref_output.shape[0], ref_output.shape[1], ref_output.shape[2]);
+    printf("Reference output[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           ref_output(0,0,0), ref_output(0,0,1), ref_output(0,0,2),
+           ref_output(0,0,3), ref_output(0,0,4));
+
+    // === GGML implementation ===
+    // Create compute context - need large buffer for full encoder
+    // 24 layers * ~132 nodes + subsampling = ~3500 nodes
+    size_t buf_size = ggml_tensor_overhead() * 8000 + ggml_graph_overhead() * 4;
+    std::vector<uint8_t> compute_buf(buf_size);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ buf_size,
+        /*.mem_buffer =*/ compute_buf.data(),
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context * ctx0 = ggml_init(params);
+    if (!ctx0) {
+        fprintf(stderr, "Failed to init ggml context\n");
+        nemo_free(ctx);
+        return false;
+    }
+
+    // Create input tensor [n_mels, time, batch]
+    struct ggml_tensor * inp = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, features, time_in, batch);
+    ggml_set_name(inp, "mel_input");
+    ggml_set_input(inp);
+
+    // Debug: check kernel_size was correctly inferred
+    printf("Inferred kernel_size: %d\n", ctx->model.hparams.kernel_size);
+
+    // Build full encoder graph
+    struct ggml_tensor * out = build_encoder(ctx0, inp, &ctx->model);
+    ggml_set_name(out, "encoder_output");
+    ggml_set_output(out);
+
+    // Build graph - need large graph for full encoder
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 16384, false);
+    ggml_build_forward_expand(gf, out);
+
+    printf("Graph nodes: %d\n", ggml_graph_n_nodes(gf));
+
+    // Allocate
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
+    if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+        fprintf(stderr, "Failed to allocate graph\n");
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+        nemo_free(ctx);
+        return false;
+    }
+
+    // Set input - transpose from [batch, time, features] to [features, time, batch]
+    std::vector<float> inp_transposed(mel_input.numel());
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t t = 0; t < time_in; t++) {
+            for (size_t ff = 0; ff < features; ff++) {
+                size_t c_idx = (b * time_in + t) * features + ff;
+                size_t g_idx = ff + t * features + b * features * time_in;
+                inp_transposed[g_idx] = mel_input.data[c_idx];
+            }
+        }
+    }
+    ggml_backend_tensor_set(inp, inp_transposed.data(), 0, inp_transposed.size() * sizeof(float));
+
+    // Compute
+    printf("Computing encoder...\n");
+    ggml_backend_graph_compute(ctx->model.backend, gf);
+
+    // Get output dimensions
+    size_t time_out = ref_output.shape[1];
+    size_t d_model = ref_output.shape[2];
+
+    printf("GGML encoder output shape: [%lld, %lld, %lld]\n",
+           (long long)out->ne[0], (long long)out->ne[1], (long long)out->ne[2]);
+    printf("Expected output shape: [%zu, %zu, %zu]\n", batch, time_out, d_model);
+
+    // Get output
+    size_t out_numel = out->ne[0] * out->ne[1] * out->ne[2];
+    std::vector<float> ggml_out(out_numel);
+    ggml_backend_tensor_get(out, ggml_out.data(), 0, out_numel * sizeof(float));
+
+    printf("GGML output[0,0,:5]: %.6f, %.6f, %.6f, %.6f, %.6f\n",
+           ggml_out[0], ggml_out[1], ggml_out[2], ggml_out[3], ggml_out[4]);
+
+    // Compare - transpose from [d_model, time, batch] to [batch, time, d_model]
+    error_calc err;
+    for (size_t b = 0; b < batch; b++) {
+        for (size_t t = 0; t < time_out; t++) {
+            for (size_t d = 0; d < d_model; d++) {
+                float ref_val = ref_output(b, t, d);
+                float ggml_val = ggml_out[d + t * d_model + b * d_model * time_out];
+                err.add(ggml_val, ref_val);
+            }
+        }
+    }
+
+    err.report("Full Encoder");
+
+    // Cleanup
+    ggml_gallocr_free(allocr);
+    ggml_free(ctx0);
+    nemo_free(ctx);
+
+    bool passed = err.max_diff < 5e-3f;  // Slightly larger tolerance for full encoder
+    printf("Full Encoder test: %s\n\n", passed ? "PASS" : "FAIL");
+    return passed;
+}
+
 struct TestEntry {
     const char * name;
     bool (*func)();
@@ -2163,6 +2363,7 @@ static TestEntry tests[] = {
     {"mha_full", test_mha_full},
     {"conformer_conv", test_conformer_conv},
     {"conformer_layer", test_conformer_layer},
+    {"encoder", test_encoder},
     {nullptr, nullptr}
 };
 

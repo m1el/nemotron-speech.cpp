@@ -31,8 +31,12 @@ test_ggml_weights: tests-ggml/test_weights.cpp $(GGML_SRCS) $(ORIG_SRCS)
 test_ggml_compute: tests-ggml/test_compute.cpp $(GGML_SRCS) $(ORIG_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
+# Precompute encoder reference output (run once, saves ~2 min per test run)
+precompute_encoder_ref: scripts/precompute_encoder_ref.cpp $(ORIG_SRCS)
+	$(CXX) $(CXXFLAGS) $^ -I include -o $@
+
 clean:
-	rm -f test_ggml_weights test_ggml_compute
+	rm -f test_ggml_weights test_ggml_compute precompute_encoder_ref
 
 test: test_ggml_weights test_ggml_compute
 	./test_ggml_weights
