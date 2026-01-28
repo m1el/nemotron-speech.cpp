@@ -54,6 +54,7 @@ struct nemo_preprocessor {
     size_t highfreq = 8000;  // sample_rate / 2
     float log_zero_guard = 5.960464477539063e-8f; // 2^-24
     float mag_power = 2.0f;
+    float last_sample = 0.0f;
 
     // Precomputed values
     std::vector<float> window;
@@ -110,7 +111,7 @@ static void stft_magnitude(nemo_preprocessor * pp, const float * audio, size_t a
     size_t hop_length = pp->n_window_stride;
     size_t win_length = pp->n_window_size;
     size_t n_bins = 1 + n_fft / 2;
-    size_t pad_amount = n_fft / 2;
+    // size_t pad_amount = n_fft / 2;
 
     // Ensure spectrogram columns are sized
     for (size_t k = 0; k < n_bins; k++) {
@@ -120,22 +121,17 @@ static void stft_magnitude(nemo_preprocessor * pp, const float * audio, size_t a
     }
 
     for (size_t t = 0; t < n_frames; t++) {
-        int64_t start = (int64_t)(t * hop_length) - (int64_t)pad_amount;
+        int64_t start = (int64_t)(t * hop_length); // already padded - (int64_t)pad_amount;
 
         // Extract and window the frame
         for (size_t i = 0; i < n_fft; i++) {
             int64_t idx = start + (int64_t)i;
             float sample = 0.0f;
-            if (idx >= 0 && idx < (int64_t)audio_len) {
-                sample = audio[idx];
-            }
+            // if (idx >= 0 && idx < (int64_t)audio_len) {
+            sample = audio[idx];
+            // }
             // Apply window
-            size_t win_offset = (n_fft - win_length) / 2;
-            if (i >= win_offset && i < win_offset + win_length) {
-                sample *= pp->window[i - win_offset];
-            } else {
-                sample = 0.0f;
-            }
+            sample *= pp->window[i];
             pp->frame[i] = sample;
         }
 
@@ -163,6 +159,8 @@ static void init_work_buffers(nemo_preprocessor * pp) {
 
     // Allocate work buffers
     pp->frame.resize(pp->n_fft);
+    size_t padding = pp->n_fft / 2;
+    pp->audio_buf.resize(padding, 0.0f);
     pp->real_out.resize(n_bins);
     pp->imag_out.resize(n_bins);
     pp->spectrogram.resize(n_bins);
@@ -237,9 +235,10 @@ struct nemo_preprocessor * nemo_preprocessor_init_from_data(
         return nullptr;
     }
 
-    // Copy window data
-    pp->window.resize(window_size);
-    memcpy(pp->window.data(), window_data, window_size * sizeof(float));
+    // Copy window data and pad to n_fft
+    size_t padding = (pp->n_fft - window_size) / 2;
+    pp->window.resize(pp->n_fft, 0.0f);
+    memcpy(pp->window.data() + padding, window_data, window_size * sizeof(float));
 
     // Copy filterbank data
     pp->filterbank.resize(pp->n_mels, n_bins);
@@ -260,6 +259,16 @@ size_t nemo_preprocessor_get_n_frames(struct nemo_preprocessor * pp, size_t n_sa
     return 1 + (padded_length - pp->n_fft) / pp->n_window_stride;
 }
 
+size_t get_full_frames(struct nemo_preprocessor * pp, size_t n_samples) {
+    size_t padding = pp->n_fft / 2;
+    assert(pp->audio_buf.size() >= padding);
+    size_t available_samples = pp->audio_buf.size() + n_samples;
+    if (available_samples < pp->n_fft) {
+        return 0;
+    }
+    return (available_samples - pp->n_fft + pp->n_window_stride) / pp->n_window_stride;
+}
+
 size_t nemo_preprocessor_process(
     struct nemo_preprocessor * pp,
     const int16_t * audio,
@@ -272,21 +281,23 @@ size_t nemo_preprocessor_process(
     }
 
     size_t n_bins = 1 + pp->n_fft / 2;
-    size_t n_frames = nemo_preprocessor_get_n_frames(pp, n_samples);
+    size_t padding = pp->n_fft / 2;
+    size_t n_frames = get_full_frames(pp, n_samples);
 
     // Convert i16 to float and apply pre-emphasis
-    if (pp->audio_buf.size() < n_samples) {
-        pp->audio_buf.resize(n_samples);
-    }
+    size_t prefix = pp->audio_buf.size();
+    pp->audio_buf.resize(prefix + n_samples);
 
     // Scale i16 to [-1, 1] and apply pre-emphasis
     const float scale = 1.0f / 32768.0f;
-    pp->audio_buf[0] = audio[0] * scale;
-    for (size_t i = 1; i < n_samples; i++) {
+    float prev = pp->last_sample;
+    for (size_t i = 0; i < n_samples; i++) {
         float curr = audio[i] * scale;
-        float prev = audio[i - 1] * scale;
-        pp->audio_buf[i] = curr - pp->preemph * prev;
+        pp->audio_buf[prefix + i] = curr - pp->preemph * prev;
+        prev = curr;
     }
+    pp->last_sample = prev;
+    n_samples = (n_frames - 1) * pp->n_window_stride + pp->n_fft;
 
     // Compute STFT magnitude
     stft_magnitude(pp, pp->audio_buf.data(), n_samples, n_frames);
@@ -314,5 +325,14 @@ size_t nemo_preprocessor_process(
         }
     }
 
+    // printf("%zu frames produced\n", n_frames);
+    // printf("%zu samples in audio buffer\n", pp->audio_buf.size());
+    // printf("%zu samples to remove\n", n_frames * pp->n_window_stride);
+    // Remove processed samples from audio buffer
+    pp->audio_buf.erase(
+        pp->audio_buf.begin(),
+        pp->audio_buf.begin()
+        + n_frames * pp->n_window_stride);
+    assert(pp->audio_buf.size() < pp->n_fft);
     return n_frames;
 }

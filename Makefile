@@ -1,85 +1,85 @@
-.PHONY: all clean test
+# Makefile for ggml-based NeMo ASR implementation
+
+GGML_DIR = /var/data/nvidia-speech/ggml
+GGML_BUILD = $(GGML_DIR)/build
 
 CXX = g++
-CXXFLAGS = -std=c++20 -Wall -Wextra -Wpedantic -O2
+CXXFLAGS = -std=c++17 -Wall -Wextra -O2
+CXXFLAGS += -I $(GGML_DIR)/include
 CXXFLAGS += -I include
-LDFLAGS = -lm
+
+# Check if CUDA backend is available
+CUDA_LIB = $(GGML_BUILD)/src/ggml-cuda/libggml-cuda.so
+CUDA_AVAILABLE = $(shell test -f $(CUDA_LIB) && echo 1 || echo 0)
+
+LDFLAGS = -L $(GGML_BUILD)/src
+LDFLAGS += -lggml -lggml-base -lggml-cpu
+LDFLAGS += -Wl,-rpath,$(GGML_BUILD)/src
+LDFLAGS += -lm -lpthread
+
+# Add CUDA support if available
+ifeq ($(CUDA_AVAILABLE),1)
+    CXXFLAGS += -DGGML_USE_CUDA
+    LDFLAGS += -L $(GGML_BUILD)/src/ggml-cuda -lggml-cuda
+    LDFLAGS += -Wl,-rpath,$(GGML_BUILD)/src/ggml-cuda
+    LDFLAGS += -L /usr/local/cuda/lib64 -lcudart -lcublas
+    LDFLAGS += -Wl,-rpath,/usr/local/cuda/lib64
+endif
 
 # Source files
-SRCS = src/ggml_weights.cpp src/ops.cpp src/conv_subsampling.cpp src/conformer_modules.cpp src/conformer_encoder.cpp src/rnnt_decoder.cpp src/rnnt_joint.cpp src/greedy_decode.cpp src/tokenizer.cpp
-OBJS = $(SRCS:.cpp=.o)
+GGML_SRCS = src-ggml/nemo-ggml.cpp src-ggml/preprocessor.cpp
+GGML_STREAM_SRCS = src-ggml/nemo-stream.cpp
 
-# Main targets
-all: nemotron-speech preprocessor test_weights test_ops test_conv_subsampling test_conformer_modules test_conformer_encoder test_rnnt_decoder test_rnnt_joint test_greedy_decode test_tokenizer
+# Original implementation (for comparison tests)
+ORIG_SRCS = src/ggml_weights.cpp src/ops.cpp src/conv_subsampling.cpp src/conformer_modules.cpp src/conformer_encoder.cpp src/rnnt_decoder.cpp src/rnnt_joint.cpp src/greedy_decode.cpp src/tokenizer.cpp
 
-# Main ASR executable
-nemotron-speech: main.cpp $(OBJS)
-	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+.PHONY: all clean test transcribe streaming
 
-# Preprocessor (standalone)
-preprocessor: preprocessor.cpp
-	$(CXX) $(CXXFLAGS) $< $(LDFLAGS) -o $@
+all: test_ggml_weights test_ggml_compute transcribe streaming
+
+streaming: test_streaming transcribe_stream
 
 # Test weight loading
-test_weights: tests/test_weights.cpp src/ggml_weights.o
+test_ggml_weights: tests-ggml/test_weights.cpp $(GGML_SRCS) $(ORIG_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
-# Test ops
-test_ops: tests/test_ops.cpp src/ops.o
+# Test computation
+test_ggml_compute: tests-ggml/test_compute.cpp $(GGML_SRCS) $(ORIG_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
-# Test conv subsampling
-test_conv_subsampling: tests/test_conv_subsampling.cpp src/conv_subsampling.o src/ops.o src/ggml_weights.o
+# Precompute encoder reference output (run once, saves ~2 min per test run)
+precompute_encoder_ref: scripts/precompute_encoder_ref.cpp $(ORIG_SRCS)
+	$(CXX) $(CXXFLAGS) $^ -I include -o $@
+
+# Transcribe example
+transcribe: src-ggml/transcribe.cpp $(GGML_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
-# Test conformer modules
-test_conformer_modules: tests/test_conformer_modules.cpp src/conformer_modules.o src/ops.o src/ggml_weights.o
+# Streaming test
+test_streaming: tests-ggml/test_streaming.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
-# Test conformer encoder
-test_conformer_encoder: tests/test_conformer_encoder.cpp src/conformer_encoder.o src/conformer_modules.o src/conv_subsampling.o src/ops.o src/ggml_weights.o
+# Python reference comparison test
+test_python_ref: tests-ggml/test_python_reference.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
-# Test RNNT decoder
-test_rnnt_decoder: tests/test_rnnt_decoder.cpp src/rnnt_decoder.o src/ops.o src/ggml_weights.o
+# Preprocessor test
+test_preprocessor: tests-ggml/test_preprocessor.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
-# Test RNNT joint
-test_rnnt_joint: tests/test_rnnt_joint.cpp src/rnnt_joint.o src/ops.o src/ggml_weights.o
+# Streaming transcribe example
+transcribe_stream: src-ggml/transcribe_stream.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
-# Test greedy decode
-test_greedy_decode: tests/test_greedy_decode.cpp src/greedy_decode.o src/rnnt_joint.o src/rnnt_decoder.o src/conformer_encoder.o src/conformer_modules.o src/conv_subsampling.o src/ops.o src/ggml_weights.o
-	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
-
-# Test tokenizer
-test_tokenizer: tests/test_tokenizer.cpp src/tokenizer.o
-	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
-
-# Compile source files
-src/%.o: src/%.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-# Run tests (skip slow encoder test by default)
-test: test_weights test_ops test_conv_subsampling test_conformer_modules test_rnnt_decoder test_rnnt_joint test_tokenizer
-	./test_weights weights/model.bin
-	./test_ops
-	./test_conv_subsampling
-	./test_conformer_modules
-	./test_rnnt_decoder
-	./test_rnnt_joint
-	./test_tokenizer
-
-# Run all tests including slow ones
-test_all: test test_conformer_encoder test_greedy_decode
-	./test_conformer_encoder
-	./test_greedy_decode
-
-# Clean build files
 clean:
-	rm -f nemotron-speech preprocessor test_weights test_ops test_conv_subsampling test_conformer_modules test_conformer_encoder test_rnnt_decoder test_rnnt_joint test_greedy_decode test_tokenizer $(OBJS)
+	rm -f test_ggml_weights test_ggml_compute precompute_encoder_ref transcribe test_streaming transcribe_stream test_python_ref test_preprocessor
 
-# Development helpers
-f:
-	$(CXX) preprocessor.cpp $(CXXFLAGS) $(LDFLAGS) -o preprocessor
-	./preprocessor
+test: test_ggml_weights test_ggml_compute
+	./test_ggml_weights
+	./test_ggml_compute
+
+test_stream: test_streaming
+	./test_streaming
+
+test_ref: test_python_ref
+	./test_python_ref
