@@ -738,6 +738,7 @@ std::string nemo_stream_process(
 // for better continuity across chunk boundaries.
 static std::string process_audio_chunked(struct nemo_stream_context* sctx) {
     struct nemo_context* nctx = sctx->nctx;
+    // nctx->timestamp_words = true;
     const int sample_rate = sctx->config.sample_rate;
     
     // Chunk size in samples (10 seconds per chunk = 160000 samples at 16kHz)
@@ -769,7 +770,7 @@ static std::string process_audio_chunked(struct nemo_stream_context* sctx) {
         //         chunk_num, processed_samples, processed_samples + this_chunk - 1, total_samples,
         //         (double)processed_samples / sample_rate,
         //         (double)(processed_samples + this_chunk) / sample_rate);
-        
+
         // Use transcription with state preservation for decoder continuity
         std::string chunk_text = nemo_transcribe_audio_with_state(
             nctx,

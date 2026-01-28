@@ -2371,13 +2371,13 @@ struct ggml_tensor * build_joint(
     nemo_joint * joint
 );
 
-std::vector<int> greedy_decode(
+std::vector<timed_token> greedy_decode(
     struct nemo_context * nctx,
     struct ggml_tensor * encoder_out,
     ggml_backend_t backend
 );
 
-std::string tokens_to_text(const std::vector<int> & tokens, const std::vector<char8> & vocab);
+std::string tokens_to_text(const std::vector<timed_token> & tokens, const std::vector<char8> & vocab, bool time_words = false);
 
 bool test_decoder() {
     printf("=== Testing Decoder (LSTM) ===\n");
@@ -2721,9 +2721,12 @@ bool test_greedy_decode() {
             printf(")\n");
         }
     }
-
+    std::vector<timed_token> ref_untimed_tokens;
+    for (int t : ref_tokens) {
+        ref_untimed_tokens.push_back({t, 0});
+    }
     // Decode using GGML's vocab
-    std::string ref_text = tokens_to_text(ref_tokens, ctx->model.vocab);
+    std::string ref_text = tokens_to_text(ref_untimed_tokens, ctx->model.vocab);
     printf("Reference transcription: %s\n", ref_text.c_str());
 
     // === GGML implementation ===
@@ -2788,11 +2791,11 @@ bool test_greedy_decode() {
 
     // Run greedy decode
     printf("Running greedy decode...\n");
-    std::vector<int> ggml_tokens = greedy_decode(ctx, encoder_out, ctx->model.backend);
+    std::vector<timed_token> ggml_tokens = greedy_decode(ctx, encoder_out, ctx->model.backend);
 
     printf("GGML tokens (%zu): ", ggml_tokens.size());
     for (size_t i = 0; i < std::min(ggml_tokens.size(), (size_t)20); i++) {
-        printf("%d ", ggml_tokens[i]);
+        printf("%d ", ggml_tokens[i].token_id);
     }
     if (ggml_tokens.size() > 20) printf("...");
     printf("\n");
@@ -2802,12 +2805,13 @@ bool test_greedy_decode() {
     printf("GGML transcription: %s\n", ggml_text.c_str());
 
     // Compare tokens
-    bool tokens_match = (ref_tokens.size() == ggml_tokens.size());
+    bool tokens_match = (ref_untimed_tokens.size() == ggml_tokens.size());
     if (tokens_match) {
         for (size_t i = 0; i < ref_tokens.size(); i++) {
-            if (ref_tokens[i] != ggml_tokens[i]) {
+            if (ref_tokens[i] != ggml_tokens[i].token_id) {
                 tokens_match = false;
-                printf("Token mismatch at position %zu: ref=%d, ggml=%d\n", i, ref_tokens[i], ggml_tokens[i]);
+                printf("Token mismatch at position %zu: ref=%d, ggml=%d\n",
+                    i, ref_tokens[i], ggml_tokens[i].token_id);
                 break;
             }
         }

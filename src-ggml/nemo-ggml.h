@@ -16,6 +16,8 @@
 #include <vector>
 #include <map>
 
+struct timed_token;
+
 // Backend type for inference
 enum nemo_backend_type {
     NEMO_BACKEND_CPU = 0,
@@ -214,6 +216,7 @@ struct nemo_context {
 
     // Number of threads for computation (CPU backend only)
     int n_threads = 4;
+    bool timestamp_words = false;
 };
 
 // API functions
@@ -306,7 +309,7 @@ struct ggml_tensor * build_encoder(
 );
 
 // Run inference from mel spectrogram
-std::vector<int> nemo_encode(
+std::vector<timed_token> nemo_encode(
     struct nemo_context * ctx,
     const float * mel_data,
     int n_mel_frames);
@@ -317,7 +320,7 @@ std::string nemo_transcribe(
     int n_mel_frames);
 
 // Run inference from raw PCM audio (16-bit signed, 16kHz, mono)
-std::vector<int> nemo_encode_audio(
+std::vector<timed_token> nemo_encode_audio(
     struct nemo_context * ctx,
     const int16_t * audio_data,
     int n_samples);
@@ -327,6 +330,23 @@ std::string nemo_transcribe_audio(
     const int16_t * audio_data,
     int n_samples);
 
+// Token with frame index for timestamp computation
+// Time = frame_idx * frame_duration_samples / sample_rate
+// Default: frame_duration = 1280 samples (80ms at 16kHz = 8 mel frames * 160 hop)
+struct timed_token {
+    int token_id;           // Token ID
+    int64_t frame_idx;          // Encoder frame index (multiply by 1280/16000 = 0.08s for time)
+    
+    timed_token(int id = 0, int64_t frame = 0)
+        : token_id(id), frame_idx(frame) {}
+    
+    // Convert frame index to seconds using given parameters
+    // Default: 1280 samples per frame at 16kHz = 80ms
+    float to_seconds(int frame_samples = 1280, int sample_rate = 16000) const {
+        return (float)frame_idx * frame_samples / sample_rate;
+    }
+};
+
 // Decoder state for streaming with state preservation
 struct nemo_decoder_state {
     int prev_token;                     // Last non-blank token emitted (-1 means uninitialized)
@@ -334,8 +354,9 @@ struct nemo_decoder_state {
     std::vector<float> c;               // LSTM cell state [n_layers * hidden_size]
     int32_t n_layers;                   // Number of LSTM layers
     int32_t hidden_size;                // LSTM hidden size
+    int64_t frame_offset;               // Current frame offset for timestamps (accumulated)
     
-    nemo_decoder_state() : prev_token(-1), n_layers(0), hidden_size(0) {}
+    nemo_decoder_state() : prev_token(-1), n_layers(0), hidden_size(0), frame_offset(0) {}
     
     void init(int32_t layers, int32_t hidden) {
         n_layers = layers;
@@ -343,12 +364,14 @@ struct nemo_decoder_state {
         h.resize(layers * hidden, 0.0f);
         c.resize(layers * hidden, 0.0f);
         prev_token = -1;
+        frame_offset = 0;
     }
     
     void reset() {
         std::fill(h.begin(), h.end(), 0.0f);
         std::fill(c.begin(), c.end(), 0.0f);
         prev_token = -1;
+        frame_offset = 0;
     }
     
     void reset(int blank_token) {
@@ -374,6 +397,7 @@ std::string nemo_transcribe_audio_with_state(
     struct nemo_context * ctx,
     const int16_t * audio_data,
     int n_samples,
-    nemo_decoder_state * decoder_state);
+    nemo_decoder_state * decoder_state
+);
 
 #endif // NEMO_GGML_H

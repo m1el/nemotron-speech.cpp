@@ -1049,12 +1049,12 @@ struct ggml_tensor * build_joint(
 // Run greedy RNN-T decoding
 // encoder_out: [d_model, time, batch] - output from build_encoder
 // Returns: vector of token IDs
-std::vector<int> greedy_decode(
+std::vector<timed_token> greedy_decode(
     struct nemo_context * nctx,
     struct ggml_tensor * encoder_out,  // [d_model, time, batch]
     ggml_backend_t backend
 ) {
-    std::vector<int> tokens;
+    std::vector<timed_token> tokens;
 
     const int d_model = encoder_out->ne[0];       // 1024
     const int time_steps = encoder_out->ne[1];
@@ -1180,7 +1180,7 @@ std::vector<int> greedy_decode(
             }
 
             // Emit non-blank token
-            tokens.push_back(best_token);
+            tokens.push_back({best_token, t});
             prev_token = best_token;
 
             // Only update LSTM state when emitting a non-blank token
@@ -1200,13 +1200,13 @@ std::vector<int> greedy_decode(
 // encoder_out: [d_model, time, batch] - output from build_encoder
 // decoder_state: if provided, uses/updates decoder state for streaming
 // Returns: vector of token IDs
-std::vector<int> greedy_decode_with_state(
+std::vector<timed_token> greedy_decode_with_state(
     struct nemo_context * nctx,
     struct ggml_tensor * encoder_out,  // [d_model, time, batch]
     ggml_backend_t backend,
     nemo_decoder_state * decoder_state  // optional: for state preservation
 ) {
-    std::vector<int> tokens;
+    std::vector<timed_token> tokens;
 
     const int d_model = encoder_out->ne[0];       // 1024
     const int time_steps = encoder_out->ne[1];
@@ -1214,6 +1214,9 @@ std::vector<int> greedy_decode_with_state(
     const int num_layers = nemo_decoder::NUM_LAYERS;    // 2
     const int vocab_size = nctx->model.hparams.vocab_size;  // 1025
     const int blank_token = vocab_size - 1;  // 1024
+
+    // Get frame offset from decoder state (for streaming across chunks)
+    int64_t frame_offset = decoder_state ? decoder_state->frame_offset : 0;
 
     // Get encoder data to CPU
     std::vector<float> enc_data(d_model * time_steps);
@@ -1341,8 +1344,9 @@ std::vector<int> greedy_decode_with_state(
                 break;
             }
 
-            // Emit non-blank token
-            tokens.push_back(best_token);
+            // Emit non-blank token with frame index
+            tokens.push_back({best_token, frame_offset + t});
+
             prev_token = best_token;
 
             // Only update LSTM state when emitting a non-blank token
@@ -1356,6 +1360,8 @@ std::vector<int> greedy_decode_with_state(
         decoder_state->prev_token = prev_token;
         decoder_state->h = std::move(h_state);
         decoder_state->c = std::move(c_state);
+        // Advance frame offset by the number of frames in this chunk
+        decoder_state->frame_offset = frame_offset + time_steps;
     }
 
     if (debug) {
@@ -1366,16 +1372,27 @@ std::vector<int> greedy_decode_with_state(
 }
 
 // Convert token IDs to text
-std::string tokens_to_text(const std::vector<int> & tokens, const std::vector<char8> & vocab) {
+std::string tokens_to_text(
+    const std::vector<struct timed_token> & tokens,
+    const std::vector<char8> & vocab,
+    bool timestamp_words = false
+) {
     std::string result;
-    for (int token : tokens) {
-        if (token >= 0 && token < (int)vocab.size()) {
-            std::string piece(vocab[token].data);
-            // SentencePiece convention: _ means space at start of word
-            if (!piece.empty() && piece[0] == '\xe2' && piece.size() >= 3 &&
-                piece[1] == '\x96' && piece[2] == '\x81') {
+    for (const struct timed_token & token : tokens) {
+        int token_id = token.token_id;
+        if (token_id >= 0 && token_id < (int)vocab.size()) {
+            std::string_view piece(vocab[token_id].data);
+            // SentencePiece convention: ▁ (U+2581, 3 bytes) means space/word start
+            if (strncmp(piece.data(), "\xe2\x96\x81", 3) == 0) {
                 // UTF-8 for ▁ (U+2581)
-                if (!result.empty()) result += ' ';
+                if (!result.empty()) {
+                    result += ' ';
+                }
+                if (timestamp_words) {
+                    char buffer[32];
+                    snprintf(buffer, sizeof(buffer), "{%.2f}", token.to_seconds());
+                    result += buffer;
+                }
                 result += piece.substr(3);
             } else {
                 result += piece;
@@ -1392,7 +1409,7 @@ std::string tokens_to_text(const std::vector<int> & tokens, const std::vector<ch
 // Run encoder + greedy decode on mel spectrogram
 // mel_data: [n_mel_frames, n_mels] row-major float array (typically n_mels=128)
 // Returns: vector of token IDs
-std::vector<int> nemo_encode(
+std::vector<timed_token> nemo_encode(
     struct nemo_context * ctx,
     const float * mel_data,
     int n_mel_frames
@@ -1457,7 +1474,7 @@ std::vector<int> nemo_encode(
     ggml_backend_graph_compute(ctx->model.backend, gf);
 
     // Run greedy decode on encoder output
-    std::vector<int> tokens = greedy_decode(ctx, encoder_out, ctx->model.backend);
+    auto tokens = greedy_decode(ctx, encoder_out, ctx->model.backend);
 
     // Cleanup
     ggml_gallocr_free(allocr);
@@ -1474,8 +1491,8 @@ std::string nemo_transcribe(
     const float * mel_data,
     int n_mel_frames
 ) {
-    std::vector<int> tokens = nemo_encode(ctx, mel_data, n_mel_frames);
-    return tokens_to_text(tokens, ctx->model.vocab);
+    auto tokens = nemo_encode(ctx, mel_data, n_mel_frames);
+    return tokens_to_text(tokens, ctx->model.vocab, false);
 }
 
 // ============================================================================
@@ -1486,7 +1503,7 @@ std::string nemo_transcribe(
 // audio_data: int16_t samples at 16kHz, mono
 // n_samples: number of audio samples
 // Returns: vector of token IDs
-std::vector<int> nemo_encode_audio(
+std::vector<timed_token> nemo_encode_audio(
     struct nemo_context * ctx,
     const int16_t * audio_data,
     int n_samples
@@ -1522,11 +1539,11 @@ std::string nemo_transcribe_audio(
     const int16_t * audio_data,
     int n_samples
 ) {
-    std::vector<int> tokens = nemo_encode_audio(ctx, audio_data, n_samples);
+    std::vector<timed_token> tokens = nemo_encode_audio(ctx, audio_data, n_samples);
     if (tokens.empty()) {
         return "";
     }
-    return tokens_to_text(tokens, ctx->model.vocab);
+    return tokens_to_text(tokens, ctx->model.vocab, false);
 }
 
 // Transcribe raw PCM audio with decoder state preservation
@@ -1609,7 +1626,7 @@ std::string nemo_transcribe_audio_with_state(
     ggml_backend_graph_compute(ctx->model.backend, gf);
 
     // Run greedy decode with state preservation
-    std::vector<int> tokens = greedy_decode_with_state(ctx, encoder_out, ctx->model.backend, decoder_state);
+    auto tokens = greedy_decode_with_state(ctx, encoder_out, ctx->model.backend, decoder_state);
 
     // Cleanup
     ggml_gallocr_free(allocr);
@@ -1618,5 +1635,5 @@ std::string nemo_transcribe_audio_with_state(
     if (tokens.empty()) {
         return "";
     }
-    return tokens_to_text(tokens, ctx->model.vocab);
+    return tokens_to_text(tokens, ctx->model.vocab, ctx->timestamp_words);
 }
