@@ -1196,6 +1196,175 @@ std::vector<int> greedy_decode(
     return tokens;
 }
 
+// Run greedy RNN-T decoding with state preservation
+// encoder_out: [d_model, time, batch] - output from build_encoder
+// decoder_state: if provided, uses/updates decoder state for streaming
+// Returns: vector of token IDs
+std::vector<int> greedy_decode_with_state(
+    struct nemo_context * nctx,
+    struct ggml_tensor * encoder_out,  // [d_model, time, batch]
+    ggml_backend_t backend,
+    nemo_decoder_state * decoder_state  // optional: for state preservation
+) {
+    std::vector<int> tokens;
+
+    const int d_model = encoder_out->ne[0];       // 1024
+    const int time_steps = encoder_out->ne[1];
+    const int hidden_size = nemo_decoder::HIDDEN_SIZE;  // 640
+    const int num_layers = nemo_decoder::NUM_LAYERS;    // 2
+    const int vocab_size = nctx->model.hparams.vocab_size;  // 1025
+    const int blank_token = vocab_size - 1;  // 1024
+
+    // Get encoder data to CPU
+    std::vector<float> enc_data(d_model * time_steps);
+    ggml_backend_tensor_get(encoder_out, enc_data.data(), 0, enc_data.size() * sizeof(float));
+
+    // Initialize decoder state - use provided state or start fresh
+    std::vector<float> h_state, c_state;
+    int prev_token;
+    
+    if (decoder_state && decoder_state->is_initialized()) {
+        // Use provided state (copy since we modify locally)
+        h_state = decoder_state->h;
+        c_state = decoder_state->c;
+        prev_token = decoder_state->prev_token;
+    } else {
+        // Start fresh
+        h_state.resize(num_layers * hidden_size, 0.0f);
+        c_state.resize(num_layers * hidden_size, 0.0f);
+        prev_token = blank_token;
+    }
+
+    // Max symbols per step (prevent infinite loops)
+    const int MAX_SYMBOLS_PER_STEP = 10;
+
+    bool debug = false;  // Set to true for debug output
+
+    for (int t = 0; t < time_steps; t++) {
+        // Extract encoder frame at time t
+        const float * enc_frame = enc_data.data() + t * d_model;
+
+        for (int sym = 0; sym < MAX_SYMBOLS_PER_STEP; sym++) {
+            // Create compute context for this step
+            size_t buf_size = ggml_tensor_overhead() * 100 + ggml_graph_overhead();
+            std::vector<uint8_t> compute_buf(buf_size);
+
+            struct ggml_init_params params = {
+                /*.mem_size   =*/ buf_size,
+                /*.mem_buffer =*/ compute_buf.data(),
+                /*.no_alloc   =*/ true,
+            };
+
+            struct ggml_context * ctx0 = ggml_init(params);
+            if (!ctx0) break;
+
+            // Create input tensors
+            struct ggml_tensor * h_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, num_layers * hidden_size);
+            struct ggml_tensor * c_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, num_layers * hidden_size);
+            struct ggml_tensor * token_emb = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
+            struct ggml_tensor * enc_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, d_model);
+            ggml_set_input(h_in);
+            ggml_set_input(c_in);
+            ggml_set_input(token_emb);
+            ggml_set_input(enc_in);
+
+            // Build decoder step
+            struct ggml_tensor * h_out = nullptr;
+            struct ggml_tensor * c_out = nullptr;
+            struct ggml_tensor * dec_out = build_decoder_step(ctx0, token_emb, h_in, c_in,
+                                                              &nctx->model.decoder, &h_out, &c_out);
+
+            // Build joint
+            struct ggml_tensor * logits = build_joint(ctx0, enc_in, dec_out, &nctx->model.joint);
+            ggml_set_output(logits);
+            ggml_set_output(h_out);
+            ggml_set_output(c_out);
+
+            // Build graph
+            struct ggml_cgraph * gf = ggml_new_graph(ctx0);
+            ggml_build_forward_expand(gf, logits);
+            ggml_build_forward_expand(gf, h_out);
+            ggml_build_forward_expand(gf, c_out);
+
+            // Allocate
+            ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+                ggml_gallocr_free(allocr);
+                ggml_free(ctx0);
+                break;
+            }
+
+            // Set inputs
+            ggml_backend_tensor_set(h_in, h_state.data(), 0, h_state.size() * sizeof(float));
+            ggml_backend_tensor_set(c_in, c_state.data(), 0, c_state.size() * sizeof(float));
+
+            // Get embedding for prev_token
+            std::vector<float> emb_data(hidden_size);
+            size_t emb_offset = prev_token * hidden_size * sizeof(float);
+            ggml_backend_tensor_get(nctx->model.decoder.embedding, emb_data.data(), emb_offset, hidden_size * sizeof(float));
+            ggml_backend_tensor_set(token_emb, emb_data.data(), 0, hidden_size * sizeof(float));
+
+            ggml_backend_tensor_set(enc_in, enc_frame, 0, d_model * sizeof(float));
+
+            // Compute
+            ggml_backend_graph_compute(backend, gf);
+
+            // Get logits and find argmax
+            std::vector<float> logits_data(vocab_size);
+            ggml_backend_tensor_get(logits, logits_data.data(), 0, vocab_size * sizeof(float));
+
+            int best_token = 0;
+            float best_score = logits_data[0];
+            for (int v = 1; v < vocab_size; v++) {
+                if (logits_data[v] > best_score) {
+                    best_score = logits_data[v];
+                    best_token = v;
+                }
+            }
+
+            // Get updated state BEFORE freeing (we'll decide whether to keep it)
+            std::vector<float> new_h_state(h_state.size());
+            std::vector<float> new_c_state(c_state.size());
+            ggml_backend_tensor_get(h_out, new_h_state.data(), 0, new_h_state.size() * sizeof(float));
+            ggml_backend_tensor_get(c_out, new_c_state.data(), 0, new_c_state.size() * sizeof(float));
+
+            ggml_gallocr_free(allocr);
+            ggml_free(ctx0);
+
+            if (debug && t < 5) {
+                printf("  t=%d sym=%d: prev_token=%d, best_token=%d (score=%.4f), blank_score=%.4f\n",
+                       t, sym, prev_token, best_token, best_score, logits_data[blank_token]);
+            }
+
+            if (best_token == blank_token) {
+                // Move to next time step - DON'T update state
+                break;
+            }
+
+            // Emit non-blank token
+            tokens.push_back(best_token);
+            prev_token = best_token;
+
+            // Only update LSTM state when emitting a non-blank token
+            h_state = std::move(new_h_state);
+            c_state = std::move(new_c_state);
+        }
+    }
+
+    // Save final state if requested
+    if (decoder_state) {
+        decoder_state->prev_token = prev_token;
+        decoder_state->h = std::move(h_state);
+        decoder_state->c = std::move(c_state);
+    }
+
+    if (debug) {
+        printf("Total tokens emitted: %zu\n", tokens.size());
+    }
+
+    return tokens;
+}
+
 // Convert token IDs to text
 std::string tokens_to_text(const std::vector<int> & tokens, const std::vector<char8> & vocab) {
     std::string result;
@@ -1354,6 +1523,98 @@ std::string nemo_transcribe_audio(
     int n_samples
 ) {
     std::vector<int> tokens = nemo_encode_audio(ctx, audio_data, n_samples);
+    if (tokens.empty()) {
+        return "";
+    }
+    return tokens_to_text(tokens, ctx->model.vocab);
+}
+
+// Transcribe raw PCM audio with decoder state preservation
+// This allows passing the final decoder state from one chunk to the next
+// for better continuity in streaming transcription
+std::string nemo_transcribe_audio_with_state(
+    struct nemo_context * ctx,
+    const int16_t * audio_data,
+    int n_samples,
+    nemo_decoder_state * decoder_state
+) {
+    if (!ctx->preprocessor) {
+        fprintf(stderr, "%s: preprocessor not initialized.\n", __func__);
+        return "";
+    }
+
+    if (n_samples <= 0) {
+        return "";
+    }
+
+    // Convert audio to mel spectrogram
+    std::vector<float> mel_data;
+    size_t n_mel_frames = nemo_preprocessor_process(ctx->preprocessor, audio_data, n_samples, mel_data);
+
+    if (n_mel_frames == 0) {
+        return "";
+    }
+
+    const int n_mels = ctx->model.hparams.n_mels;  // 128
+    const int batch = 1;
+
+    // Allocate compute context for encoder graph
+    size_t buf_size = ggml_tensor_overhead() * 8000 + ggml_graph_overhead() * 4;
+    std::vector<uint8_t> compute_buf(buf_size);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ buf_size,
+        /*.mem_buffer =*/ compute_buf.data(),
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context * ctx0 = ggml_init(params);
+    if (!ctx0) {
+        fprintf(stderr, "%s: failed to init ggml context\n", __func__);
+        return "";
+    }
+
+    // Create mel input tensor [n_mels, time, batch]
+    struct ggml_tensor * inp = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_mels, (int)n_mel_frames, batch);
+    ggml_set_name(inp, "mel_input");
+    ggml_set_input(inp);
+
+    // Build encoder graph
+    struct ggml_tensor * encoder_out = build_encoder(ctx0, inp, &ctx->model);
+    ggml_set_name(encoder_out, "encoder_output");
+    ggml_set_output(encoder_out);
+
+    // Build and allocate graph
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 16384, false);
+    ggml_build_forward_expand(gf, encoder_out);
+
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->model.backend));
+    if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+        fprintf(stderr, "%s: failed to allocate graph\n", __func__);
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx0);
+        return "";
+    }
+
+    // Set mel input - transpose from [time, mels] to [mels, time, batch]
+    std::vector<float> inp_transposed(n_mels * n_mel_frames);
+    for (size_t t = 0; t < n_mel_frames; t++) {
+        for (int m = 0; m < n_mels; m++) {
+            inp_transposed[m + t * n_mels] = mel_data[t * n_mels + m];
+        }
+    }
+    ggml_backend_tensor_set(inp, inp_transposed.data(), 0, inp_transposed.size() * sizeof(float));
+
+    // Run encoder
+    ggml_backend_graph_compute(ctx->model.backend, gf);
+
+    // Run greedy decode with state preservation
+    std::vector<int> tokens = greedy_decode_with_state(ctx, encoder_out, ctx->model.backend, decoder_state);
+
+    // Cleanup
+    ggml_gallocr_free(allocr);
+    ggml_free(ctx0);
+
     if (tokens.empty()) {
         return "";
     }

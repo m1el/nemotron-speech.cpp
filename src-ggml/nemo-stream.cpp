@@ -130,19 +130,7 @@ size_t nemo_encoder_cache::memory_usage_bytes() const {
     return total;
 }
 
-void nemo_decoder_state::init(int32_t layers, int32_t hidden) {
-    n_layers = layers;
-    hidden_size = hidden;
-    h.resize(layers * hidden, 0.0f);
-    c.resize(layers * hidden, 0.0f);
-    prev_token = -1;  // Will use blank token from config
-}
-
-void nemo_decoder_state::reset() {
-    std::fill(h.begin(), h.end(), 0.0f);
-    std::fill(c.begin(), c.end(), 0.0f);
-    prev_token = -1;
-}
+// nemo_decoder_state::init and reset are now inline in nemo-ggml.h
 
 // =============================================================================
 // Pre-built Encoder Graph
@@ -976,7 +964,8 @@ std::string nemo_stream_process(
 // Process audio in chunks using the batch encoder
 // This approach processes audio in fixed-size chunks (e.g., 10 seconds each)
 // to support unlimited audio length while maintaining correct transcription.
-// Each chunk is processed independently through the batch encoder (which works correctly).
+// Decoder state (prev_token, LSTM hidden/cell states) is preserved between chunks
+// for better continuity across chunk boundaries.
 static std::string process_audio_chunked(struct nemo_stream_context* sctx) {
     struct nemo_context* nctx = sctx->nctx;
     const int sample_rate = sctx->config.sample_rate;
@@ -992,22 +981,31 @@ static std::string process_audio_chunked(struct nemo_stream_context* sctx) {
     size_t processed_samples = 0;
     int chunk_num = 0;
     
+    // Decoder state preserved across chunks for better continuity
+    // The prev_token and LSTM states carry over from one chunk to the next
+    nemo_decoder_state decoder_state;
+    // Initialize with proper dimensions (2 LSTM layers, 640 hidden size)
+    // The blank token (1024) is used as initial prev_token
+    decoder_state.init(2, 640);
+    decoder_state.prev_token = sctx->config.blank_token;  // 1024
+    
     while (processed_samples < total_samples) {
         // Calculate chunk size for this iteration
         size_t remaining = total_samples - processed_samples;
         size_t this_chunk = std::min(remaining, chunk_samples);
         
         chunk_num++;
-        fprintf(stderr, "[STREAM] Processing chunk %d: samples %zu-%zu of %zu (%.1f-%.1f sec)\n",
-                chunk_num, processed_samples, processed_samples + this_chunk - 1, total_samples,
-                (double)processed_samples / sample_rate,
-                (double)(processed_samples + this_chunk) / sample_rate);
+        // fprintf(stderr, "[STREAM] Processing chunk %d: samples %zu-%zu of %zu (%.1f-%.1f sec)\n",
+        //         chunk_num, processed_samples, processed_samples + this_chunk - 1, total_samples,
+        //         (double)processed_samples / sample_rate,
+        //         (double)(processed_samples + this_chunk) / sample_rate);
         
-        // Use the batch transcription for each chunk (known to work correctly)
-        std::string chunk_text = nemo_transcribe_audio(
+        // Use transcription with state preservation for decoder continuity
+        std::string chunk_text = nemo_transcribe_audio_with_state(
             nctx,
             audio_data + processed_samples,
-            this_chunk
+            this_chunk,
+            &decoder_state
         );
         
         // Append to full transcript
@@ -1017,7 +1015,7 @@ static std::string process_audio_chunked(struct nemo_stream_context* sctx) {
             }
             full_transcript += chunk_text;
         }
-        
+        printf("%s\n", chunk_text.c_str());
         processed_samples += this_chunk;
     }
     

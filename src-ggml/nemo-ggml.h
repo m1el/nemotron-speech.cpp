@@ -327,4 +327,53 @@ std::string nemo_transcribe_audio(
     const int16_t * audio_data,
     int n_samples);
 
+// Decoder state for streaming with state preservation
+struct nemo_decoder_state {
+    int prev_token;                     // Last non-blank token emitted (-1 means uninitialized)
+    std::vector<float> h;               // LSTM hidden state [n_layers * hidden_size]
+    std::vector<float> c;               // LSTM cell state [n_layers * hidden_size]
+    int32_t n_layers;                   // Number of LSTM layers
+    int32_t hidden_size;                // LSTM hidden size
+    
+    nemo_decoder_state() : prev_token(-1), n_layers(0), hidden_size(0) {}
+    
+    void init(int32_t layers, int32_t hidden) {
+        n_layers = layers;
+        hidden_size = hidden;
+        h.resize(layers * hidden, 0.0f);
+        c.resize(layers * hidden, 0.0f);
+        prev_token = -1;
+    }
+    
+    void reset() {
+        std::fill(h.begin(), h.end(), 0.0f);
+        std::fill(c.begin(), c.end(), 0.0f);
+        prev_token = -1;
+    }
+    
+    void reset(int blank_token) {
+        reset();
+        prev_token = blank_token;
+    }
+    
+    bool is_initialized() const {
+        return prev_token >= 0 && !h.empty() && !c.empty();
+    }
+    
+    // Get state for specific layer
+    float* h_layer(int layer) { return h.data() + layer * hidden_size; }
+    float* c_layer(int layer) { return c.data() + layer * hidden_size; }
+    const float* h_layer(int layer) const { return h.data() + layer * hidden_size; }
+    const float* c_layer(int layer) const { return c.data() + layer * hidden_size; }
+};
+
+// Transcribe audio with decoder state preservation (for streaming)
+// If decoder_state is provided and initialized, uses it as initial state
+// After transcription, decoder_state is updated with final state
+std::string nemo_transcribe_audio_with_state(
+    struct nemo_context * ctx,
+    const int16_t * audio_data,
+    int n_samples,
+    nemo_decoder_state * decoder_state);
+
 #endif // NEMO_GGML_H

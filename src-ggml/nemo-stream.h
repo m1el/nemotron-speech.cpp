@@ -116,26 +116,9 @@ struct nemo_encoder_cache {
 };
 
 // =============================================================================
-// Decoder State
+// Decoder State - defined in nemo-ggml.h
 // =============================================================================
-
-// LSTM decoder state for RNN-T
-struct nemo_decoder_state {
-    std::vector<float> h;         // Hidden state [n_layers * hidden_size]
-    std::vector<float> c;         // Cell state [n_layers * hidden_size]
-    int32_t prev_token;           // Previous emitted token (for embedding lookup)
-    int32_t n_layers;             // Number of LSTM layers
-    int32_t hidden_size;          // LSTM hidden size
-    
-    void init(int32_t layers, int32_t hidden);
-    void reset();
-    
-    // Get state for specific layer
-    float* h_layer(int layer) { return h.data() + layer * hidden_size; }
-    float* c_layer(int layer) { return c.data() + layer * hidden_size; }
-    const float* h_layer(int layer) const { return h.data() + layer * hidden_size; }
-    const float* c_layer(int layer) const { return c.data() + layer * hidden_size; }
-};
+// nemo_decoder_state is defined in nemo-ggml.h
 
 // =============================================================================
 // Streaming Context
