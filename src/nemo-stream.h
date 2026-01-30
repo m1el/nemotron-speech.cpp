@@ -229,6 +229,7 @@ struct nemo_stream_context {
     // Initialize from model context
     void init(struct nemo_context* ctx, const nemo_cache_config& cfg);
     void reset();
+    ~nemo_stream_context();
     
     // Real-time factor (compute time / audio time)
     double rtf() const { 

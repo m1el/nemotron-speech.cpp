@@ -91,6 +91,17 @@ void nemo_stream_context::reset() {
     // Don't reset decode_graph - it can be reused
 }
 
+nemo_stream_context::~nemo_stream_context() {
+    if (decode_allocr) {
+        ggml_gallocr_free(decode_allocr);
+        decode_allocr = nullptr;
+    }
+    if (decode_ctx) {
+        ggml_free(decode_ctx);
+        decode_ctx = nullptr;
+    }
+}
+
 void nemo_encoder_graph::build_streaming_encoder(
     struct ggml_context * ctx,
     struct nemo_context* nctx,
@@ -107,7 +118,6 @@ void nemo_encoder_graph::build_streaming_encoder(
     mel_input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_mels, mel_chunk_frames, 1);
     ggml_set_name(mel_input, "mel_input");
     ggml_set_input(mel_input);
-    ggml_set_output(mel_input);  // Keep buffer readable after graph compute
 
     // Run subsampling
     struct ggml_tensor* subsampled = build_conv_subsampling(ctx, mel_input, &nctx->model.encoder.subsampling);
@@ -151,12 +161,6 @@ void nemo_encoder_graph::build_streaming_encoder(
         k_cache_ins[l] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model, cache_len);
         v_cache_ins[l] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model, cache_len);
         conv_cache_ins[l] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model, conv_cache_len);
-        // ggml_set_input(k_cache_ins[l]);
-        // ggml_set_input(v_cache_ins[l]);
-        // ggml_set_input(conv_cache_ins[l]);
-        // ggml_set_output(k_cache_ins[l]);
-        // ggml_set_output(v_cache_ins[l]);
-        // ggml_set_output(conv_cache_ins[l]);
     }
 
     // Create attention mask for invalid cache positions
@@ -189,8 +193,11 @@ void nemo_encoder_graph::build_streaming_encoder(
     
     for (int l = 0; l < n_layers; l++) {
         k_cache_ins[l] = ggml_cpy(ctx, k_cache_outs[l], k_cache_ins[l]);
+        ggml_set_output(k_cache_ins[l]);
         v_cache_ins[l] = ggml_cpy(ctx, v_cache_outs[l], v_cache_ins[l]);
+        ggml_set_output(v_cache_ins[l]);
         conv_cache_ins[l] = ggml_cpy(ctx, conv_cache_outs[l], conv_cache_ins[l]);
+        ggml_set_output(conv_cache_ins[l]);
     }
     
     // Build the compute graph
@@ -680,6 +687,77 @@ static std::string tokens_to_text_simple(const std::vector<int>& token_ids, cons
 // Forward declaration for dump function
 void append_dump_array(const float* data, int64_t *ne, size_t n_elements, const char* filename);
 
+// Helper: Initialize the decode graph once (called on first decode)
+static void init_decode_graph(nemo_stream_context* sctx) {
+    nemo_context* nctx = sctx->nctx;
+    const int d_model = sctx->config.d_model;
+    const int hidden_size = sctx->config.decoder_hidden;
+    const int num_layers = sctx->config.decoder_layers;
+
+    // Create compute context for the graph
+    size_t buf_size = ggml_tensor_overhead() * 100 + ggml_graph_overhead();
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ buf_size,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    sctx->decode_ctx = ggml_init(params);
+    if (!sctx->decode_ctx) {
+        fprintf(stderr, "[ERROR] Failed to create decode context\n");
+        return;
+    }
+
+    struct ggml_context* ctx0 = sctx->decode_ctx;
+
+    // Create input tensors
+    sctx->decode_h_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, num_layers * hidden_size);
+    sctx->decode_c_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, num_layers * hidden_size);
+    sctx->decode_token_emb = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
+    sctx->decode_enc_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, d_model);
+    ggml_set_input(sctx->decode_h_in);
+    ggml_set_input(sctx->decode_c_in);
+    ggml_set_input(sctx->decode_token_emb);
+    ggml_set_input(sctx->decode_enc_in);
+
+    // Build decoder step
+    struct ggml_tensor* h_out = nullptr;
+    struct ggml_tensor* c_out = nullptr;
+    struct ggml_tensor* dec_out = build_decoder_step(ctx0, sctx->decode_token_emb,
+                                                      sctx->decode_h_in, sctx->decode_c_in,
+                                                      &nctx->model.decoder, &h_out, &c_out);
+
+    // Build joint
+    struct ggml_tensor* logits = build_joint(ctx0, sctx->decode_enc_in, dec_out, &nctx->model.joint);
+    ggml_set_output(logits);
+    ggml_set_output(h_out);
+    ggml_set_output(c_out);
+
+    // Store output tensor pointers
+    sctx->decode_logits = logits;
+    sctx->decode_h_out = h_out;
+    sctx->decode_c_out = c_out;
+
+    // Build graph
+    sctx->decode_graph = ggml_new_graph(ctx0);
+    ggml_build_forward_expand(sctx->decode_graph, logits);
+    ggml_build_forward_expand(sctx->decode_graph, h_out);
+    ggml_build_forward_expand(sctx->decode_graph, c_out);
+
+    // Allocate
+    sctx->decode_allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(nctx->model.backend));
+    if (!ggml_gallocr_alloc_graph(sctx->decode_allocr, sctx->decode_graph)) {
+        fprintf(stderr, "[ERROR] Failed to allocate decode graph\n");
+        ggml_gallocr_free(sctx->decode_allocr);
+        ggml_free(sctx->decode_ctx);
+        sctx->decode_allocr = nullptr;
+        sctx->decode_ctx = nullptr;
+        return;
+    }
+
+    sctx->decode_graph_initialized = true;
+}
+
 // Helper: Run one step of greedy decode for a single encoder frame
 // Returns all tokens emitted for this frame (can be 0 to MAX_SYMBOLS_PER_STEP)
 static std::vector<int> decode_one_step(
@@ -689,90 +767,44 @@ static std::vector<int> decode_one_step(
     nemo_context* nctx = sctx->nctx;
     const int d_model = sctx->config.d_model;
     const int hidden_size = sctx->config.decoder_hidden;
-    const int num_layers = sctx->config.decoder_layers;
     const int vocab_size = sctx->config.vocab_size;
     const int blank_token = sctx->config.blank_token;
     const int MAX_SYMBOLS_PER_STEP = 10;
 
+    // Initialize decode graph on first use
+    if (!sctx->decode_graph_initialized) {
+        init_decode_graph(sctx);
+        if (!sctx->decode_graph_initialized) {
+            return {};  // Initialization failed
+        }
+    }
+
     std::vector<int> emitted_tokens;  // All tokens emitted for this encoder frame
+    std::vector<float> emb_data(hidden_size);
+    std::vector<float> logits_data(vocab_size);
+    std::vector<float> new_h_state(sctx->decoder_state.h.size());
+    std::vector<float> new_c_state(sctx->decoder_state.c.size());
 
     for (int sym = 0; sym < MAX_SYMBOLS_PER_STEP; sym++) {
-        // Create compute context for this step
-        size_t buf_size = ggml_tensor_overhead() * 100 + ggml_graph_overhead();
-        std::vector<uint8_t> compute_buf(buf_size);
-
-        struct ggml_init_params params = {
-            /*.mem_size   =*/ buf_size,
-            /*.mem_buffer =*/ compute_buf.data(),
-            /*.no_alloc   =*/ true,
-        };
-
-        struct ggml_context* ctx0 = ggml_init(params);
-        if (!ctx0) break;
-
-        // Create input tensors
-        struct ggml_tensor* h_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, num_layers * hidden_size);
-        struct ggml_tensor* c_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, num_layers * hidden_size);
-        struct ggml_tensor* token_emb = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
-        struct ggml_tensor* enc_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, d_model);
-        ggml_set_input(h_in);
-        ggml_set_input(c_in);
-        ggml_set_input(token_emb);
-        ggml_set_input(enc_in);
-
-        // Build decoder step
-        struct ggml_tensor* h_out = nullptr;
-        struct ggml_tensor* c_out = nullptr;
-        struct ggml_tensor* dec_out = build_decoder_step(ctx0, token_emb, h_in, c_in,
-                                                          &nctx->model.decoder, &h_out, &c_out);
-
-        // Build joint
-        struct ggml_tensor* logits = build_joint(ctx0, enc_in, dec_out, &nctx->model.joint);
-        ggml_set_output(logits);
-        ggml_set_output(h_out);
-        ggml_set_output(c_out);
-
-        // Build graph
-        struct ggml_cgraph* gf = ggml_new_graph(ctx0);
-        ggml_build_forward_expand(gf, logits);
-        ggml_build_forward_expand(gf, h_out);
-        ggml_build_forward_expand(gf, c_out);
-
-        // Allocate
-        ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(nctx->model.backend));
-        if (!ggml_gallocr_alloc_graph(allocr, gf)) {
-            ggml_gallocr_free(allocr);
-            ggml_free(ctx0);
-            break;
-        }
-
         // Set inputs
-        ggml_backend_tensor_set(h_in, sctx->decoder_state.h.data(), 0,
+        ggml_backend_tensor_set(sctx->decode_h_in, sctx->decoder_state.h.data(), 0,
                                  sctx->decoder_state.h.size() * sizeof(float));
-        ggml_backend_tensor_set(c_in, sctx->decoder_state.c.data(), 0,
+        ggml_backend_tensor_set(sctx->decode_c_in, sctx->decoder_state.c.data(), 0,
                                  sctx->decoder_state.c.size() * sizeof(float));
 
         // Get embedding for prev_token
-        std::vector<float> emb_data(hidden_size);
         size_t emb_offset = sctx->decoder_state.prev_token * hidden_size * sizeof(float);
         ggml_backend_tensor_get(nctx->model.decoder.embedding, emb_data.data(), emb_offset,
                                  hidden_size * sizeof(float));
-        ggml_backend_tensor_set(token_emb, emb_data.data(), 0, hidden_size * sizeof(float));
+        ggml_backend_tensor_set(sctx->decode_token_emb, emb_data.data(), 0, hidden_size * sizeof(float));
 
-        ggml_backend_tensor_set(enc_in, enc_frame, 0, d_model * sizeof(float));
-
-        // // Synchronize to ensure tensor is set before compute
-        // ggml_backend_synchronize(nctx->model.backend);
+        ggml_backend_tensor_set(sctx->decode_enc_in, enc_frame, 0, d_model * sizeof(float));
 
         // Compute
-        ggml_backend_graph_compute(nctx->model.backend, gf);
-
-        // // Synchronize after compute
-        // ggml_backend_synchronize(nctx->model.backend);
+        ggml_backend_graph_compute(nctx->model.backend, sctx->decode_graph);
 
         // Get logits and find argmax
-        std::vector<float> logits_data(vocab_size);
-        ggml_backend_tensor_get(logits, logits_data.data(), 0, vocab_size * sizeof(float));
+        ggml_backend_tensor_get(sctx->decode_logits, logits_data.data(), 0, vocab_size * sizeof(float));
 
         int best_token = 0;
         float best_score = logits_data[0];
@@ -783,27 +815,22 @@ static std::vector<int> decode_one_step(
             }
         }
 
-        // Get updated state
-        std::vector<float> new_h_state(sctx->decoder_state.h.size());
-        std::vector<float> new_c_state(sctx->decoder_state.c.size());
-        ggml_backend_tensor_get(h_out, new_h_state.data(), 0, new_h_state.size() * sizeof(float));
-        ggml_backend_tensor_get(c_out, new_c_state.data(), 0, new_c_state.size() * sizeof(float));
-
-        ggml_gallocr_free(allocr);
-        ggml_free(ctx0);
-
         if (best_token == blank_token) {
             // Move to next time step - DON'T update state
             break;
         }
+
+        // Get updated state
+        ggml_backend_tensor_get(sctx->decode_h_out, new_h_state.data(), 0, new_h_state.size() * sizeof(float));
+        ggml_backend_tensor_get(sctx->decode_c_out, new_c_state.data(), 0, new_c_state.size() * sizeof(float));
 
         // Emit non-blank token
         emitted_tokens.push_back(best_token);
         sctx->decoder_state.prev_token = best_token;
 
         // Only update LSTM state when emitting a non-blank token
-        sctx->decoder_state.h = std::move(new_h_state);
-        sctx->decoder_state.c = std::move(new_c_state);
+        sctx->decoder_state.h = new_h_state;
+        sctx->decoder_state.c = new_c_state;
     }
 
     return emitted_tokens;
