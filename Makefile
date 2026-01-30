@@ -33,7 +33,7 @@ GGML_STREAM_SRCS = src/nemo-stream.cpp
 # Original implementation (for comparison tests)
 ORIG_SRCS = src/reference/ggml_weights.cpp src/reference/ops.cpp src/reference/conv_subsampling.cpp src/reference/conformer_modules.cpp src/reference/conformer_encoder.cpp src/reference/rnnt_decoder.cpp src/reference/rnnt_joint.cpp src/reference/greedy_decode.cpp src/reference/tokenizer.cpp
 
-.PHONY: all clean test transcribe streaming
+.PHONY: all clean clean_bin test transcribe streaming
 
 all: test_ggml_weights test_ggml_compute transcribe streaming
 
@@ -73,6 +73,9 @@ transcribe_stream: src/transcribe_stream.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
 
 clean:
 	rm -f test_ggml_weights test_ggml_compute precompute_encoder_ref transcribe test_streaming transcribe_stream test_python_ref test_preprocessor
+
+clean_bin:
+	rm my_bin/*
 
 test: test_ggml_weights test_ggml_compute
 	./test_ggml_weights

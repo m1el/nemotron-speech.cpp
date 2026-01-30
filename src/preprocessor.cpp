@@ -109,7 +109,6 @@ static void dft_frame(nemo_preprocessor * pp, const float * frame) {
 static void stft_magnitude(nemo_preprocessor * pp, const float * audio, size_t audio_len, size_t n_frames) {
     size_t n_fft = pp->n_fft;
     size_t hop_length = pp->n_window_stride;
-    size_t win_length = pp->n_window_size;
     size_t n_bins = 1 + n_fft / 2;
     // size_t pad_amount = n_fft / 2;
 
@@ -121,12 +120,13 @@ static void stft_magnitude(nemo_preprocessor * pp, const float * audio, size_t a
     }
 
     for (size_t t = 0; t < n_frames; t++) {
-        int64_t start = (int64_t)(t * hop_length); // already padded - (int64_t)pad_amount;
+        size_t start = t * hop_length; // already padded - (int64_t)pad_amount;
 
         // Extract and window the frame
         for (size_t i = 0; i < n_fft; i++) {
-            int64_t idx = start + (int64_t)i;
+            size_t idx = start + i;
             float sample = 0.0f;
+            assert(idx < audio_len);
             // if (idx >= 0 && idx < (int64_t)audio_len) {
             sample = audio[idx];
             // }
@@ -281,7 +281,6 @@ size_t nemo_preprocessor_process(
     }
 
     size_t n_bins = 1 + pp->n_fft / 2;
-    size_t padding = pp->n_fft / 2;
     size_t n_frames = get_full_frames(pp, n_samples);
 
     // Convert i16 to float and apply pre-emphasis

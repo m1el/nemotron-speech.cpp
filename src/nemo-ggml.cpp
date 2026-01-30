@@ -802,7 +802,8 @@ static struct ggml_tensor * build_causal_conv2d(
     struct ggml_tensor * input,   // [W, H, C, N]
     struct ggml_tensor * weight,  // [KW, KH, IC, OC]
     struct ggml_tensor * bias,    // [OC]
-    int stride_w, int stride_h
+    int stride_w, int stride_h,
+    const char* debug_name = nullptr
 ) {
     // Causal padding: pad_left = kW-1, pad_right = stride-1, pad_top = kH-1, pad_bottom = stride-1
     int kW = weight->ne[0];
@@ -813,6 +814,12 @@ static struct ggml_tensor * build_causal_conv2d(
     int pad_bottom = stride_h - 1;
 
     struct ggml_tensor * padded = ggml_pad_ext(ctx, input, pad_left, pad_right, pad_top, pad_bottom, 0, 0, 0, 0);
+    if (debug_name) {
+        char name[64];
+        snprintf(name, sizeof(name), "%s_padded", debug_name);
+        ggml_set_name(padded, name);
+        ggml_set_output(padded);
+    }
     struct ggml_tensor * conv_out = ggml_conv_2d(ctx, weight, padded, stride_w, stride_h, 0, 0, 1, 1);
 
     // Add bias
@@ -858,28 +865,49 @@ struct ggml_tensor * build_conv_subsampling(
 
     // Reshape to 4D for conv2d: [n_mels, time, 1, batch]
     struct ggml_tensor * cur = ggml_reshape_4d(ctx, mel, n_mels, time_in, 1, batch);
+    ggml_set_name(cur, "conv_input");
+    ggml_set_output(cur);
 
     // Conv0: CausalConv2D(1, 256, k=3, s=2) + ReLU
-    cur = build_causal_conv2d(ctx, cur, sub->conv0_w, sub->conv0_b, 2, 2);
+    cur = build_causal_conv2d(ctx, cur, sub->conv0_w, sub->conv0_b, 2, 2, "conv0");
+    ggml_set_name(cur, "conv_layer0");
+    ggml_set_output(cur);
+
     cur = ggml_relu(ctx, cur);
+    ggml_set_name(cur, "conv_layer1");
+    ggml_set_output(cur);
 
     // Conv2: Depthwise CausalConv2D(256, k=3, s=2, groups=256)
     cur = build_causal_dw_conv2d(ctx, cur, sub->conv2_w, sub->conv2_b, 2, 2);
+    ggml_set_name(cur, "conv_layer2");
+    ggml_set_output(cur);
 
     // Conv3: Pointwise Conv2D(256, 256, k=1, s=1) + ReLU
     cur = ggml_conv_2d(ctx, sub->conv3_w, cur, 1, 1, 0, 0, 1, 1);
     struct ggml_tensor * conv3_b_reshaped = ggml_reshape_4d(ctx, sub->conv3_b, 1, 1, sub->conv3_b->ne[0], 1);
     cur = ggml_add(ctx, cur, conv3_b_reshaped);
+    ggml_set_name(cur, "conv_layer3");
+    ggml_set_output(cur);
+
     cur = ggml_relu(ctx, cur);
+    ggml_set_name(cur, "conv_layer4");
+    ggml_set_output(cur);
 
     // Conv5: Depthwise CausalConv2D(256, k=3, s=2, groups=256)
     cur = build_causal_dw_conv2d(ctx, cur, sub->conv5_w, sub->conv5_b, 2, 2);
+    ggml_set_name(cur, "conv_layer5");
+    ggml_set_output(cur);
 
     // Conv6: Pointwise Conv2D(256, 256, k=1, s=1) + ReLU
     cur = ggml_conv_2d(ctx, sub->conv6_w, cur, 1, 1, 0, 0, 1, 1);
     struct ggml_tensor * conv6_b_reshaped = ggml_reshape_4d(ctx, sub->conv6_b, 1, 1, sub->conv6_b->ne[0], 1);
     cur = ggml_add(ctx, cur, conv6_b_reshaped);
+    ggml_set_name(cur, "conv_layer6_pre_relu");
+    ggml_set_output(cur);
+
     cur = ggml_relu(ctx, cur);
+    ggml_set_name(cur, "conv_layer6");
+    ggml_set_output(cur);
 
     // cur shape: [W_out, H_out, 256, batch] where W_out ~= n_mels/8, H_out ~= time/8
     int64_t w_out = cur->ne[0];  // ~17 for n_mels=128
@@ -897,6 +925,9 @@ struct ggml_tensor * build_conv_subsampling(
     // Add bias
     cur = ggml_add(ctx, cur, sub->out_b);
 
+    ggml_set_name(cur, "conv_subsampling_out");
+    ggml_set_output(cur);
+
     return cur;  // [d_model, time_out, batch]
 }
 
@@ -910,7 +941,7 @@ struct ggml_tensor * build_conv_subsampling(
 struct ggml_tensor * build_encoder(
     struct ggml_context * ctx,
     struct ggml_tensor * mel,       // [n_mels, time, batch]
-    nemo_model * model              // model with all weights
+    nemo_model * model             // model with all weights
 ) {
     const int n_heads = model->hparams.n_heads;     // 8
     const int d_head = model->hparams.d_head;       // 128
@@ -920,6 +951,8 @@ struct ggml_tensor * build_encoder(
 
     // 1. ConvSubsampling: [n_mels, time, batch] -> [d_model, time/8, batch]
     struct ggml_tensor * cur = build_conv_subsampling(ctx, mel, &model->encoder.subsampling);
+    // ggml_set_name(cur, "pre_encoded");  // [d_model, time/8, batch]
+    // ggml_set_output(cur);
 
     // int64_t batch = cur->ne[2];
     int64_t seq_len = cur->ne[1];  // time/8
@@ -1026,10 +1059,14 @@ struct ggml_tensor * build_joint(
     // enc_w is [joint_dim, d_model], mul_mat computes enc @ enc_w.T = [joint_dim]
     struct ggml_tensor * enc_proj = ggml_mul_mat(ctx, joint->enc_w, enc);
     enc_proj = ggml_add(ctx, enc_proj, joint->enc_b);
+    ggml_set_name(enc_proj, "joint_enc_proj");
+    ggml_set_output(enc_proj);
 
     // Project decoder: [hidden_size] -> [joint_dim]
     struct ggml_tensor * dec_proj = ggml_mul_mat(ctx, joint->dec_w, decoder_out);
     dec_proj = ggml_add(ctx, dec_proj, joint->dec_b);
+    ggml_set_name(dec_proj, "joint_dec_proj");
+    ggml_set_output(dec_proj);
 
     // Add and ReLU
     struct ggml_tensor * joint_out = ggml_add(ctx, enc_proj, dec_proj);
@@ -1458,15 +1495,8 @@ std::vector<timed_token> nemo_encode(
         return {};
     }
 
-    // Set mel input - transpose from [time, mels] to [mels, time, batch]
-    // Input mel_data is row-major [n_mel_frames, n_mels]
-    std::vector<float> inp_transposed(n_mels * n_mel_frames);
-    for (int t = 0; t < n_mel_frames; t++) {
-        for (int m = 0; m < n_mels; m++) {
-            inp_transposed[m + t * n_mels] = mel_data[t * n_mels + m];
-        }
-    }
-    ggml_backend_tensor_set(inp, inp_transposed.data(), 0, inp_transposed.size() * sizeof(float));
+
+    ggml_backend_tensor_set(inp, mel_data, 0, n_mel_frames * n_mels * sizeof(float));
 
     // Run encoder
     ggml_backend_graph_compute(ctx->model.backend, gf);
@@ -1534,10 +1564,13 @@ std::vector<timed_token> nemo_encode_audio(
 // Returns: transcribed text string
 std::string nemo_transcribe_audio(
     struct nemo_context * ctx,
-    const int16_t * audio_data,
-    int n_samples
+    std::vector<int16_t> & audio_data
 ) {
-    std::vector<timed_token> tokens = nemo_encode_audio(ctx, audio_data, n_samples);
+    // Convert audio to mel spectrogram
+    std::vector<float> mel;
+    size_t n_frames = nemo_preprocessor_process(ctx->preprocessor, audio_data.data(), (int)audio_data.size(), mel);
+    (void)n_frames;
+    std::vector<timed_token> tokens = nemo_encode(ctx, mel.data(), (int)mel.size() / ctx->model.hparams.n_mels);
     if (tokens.empty()) {
         return "";
     }
@@ -1549,8 +1582,7 @@ std::string nemo_transcribe_audio(
 // for better continuity in streaming transcription
 std::string nemo_transcribe_audio_with_state(
     struct nemo_context * ctx,
-    const int16_t * audio_data,
-    int n_samples,
+    std::vector<float> & mel_data,
     nemo_decoder_state * decoder_state
 ) {
     if (!ctx->preprocessor) {
@@ -1558,19 +1590,13 @@ std::string nemo_transcribe_audio_with_state(
         return "";
     }
 
-    if (n_samples <= 0) {
-        return "";
-    }
-
-    // Convert audio to mel spectrogram
-    std::vector<float> mel_data;
-    size_t n_mel_frames = nemo_preprocessor_process(ctx->preprocessor, audio_data, n_samples, mel_data);
+    const int n_mels = ctx->model.hparams.n_mels;  // 128
+    size_t n_mel_frames = mel_data.size() / n_mels;
 
     if (n_mel_frames == 0) {
         return "";
     }
 
-    const int n_mels = ctx->model.hparams.n_mels;  // 128
     const int batch = 1;
 
     // Allocate compute context for encoder graph

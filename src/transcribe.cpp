@@ -6,7 +6,7 @@
 //   - Raw PCM audio: 16-bit signed, 16kHz, mono (.pcm, .raw)
 //   - Mel spectrogram: float32 [time, 128] row-major (.mel.bin) with --mel flag
 
-#include "../src-ggml/nemo-ggml.h"
+#include "../src/nemo-ggml.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -89,7 +89,7 @@ int main(int argc, char ** argv) {
     }
 
     printf("Transcribing...\n");
-    text = nemo_transcribe_audio(ctx, audio_data.data(), n_samples);
+    text = nemo_transcribe_audio(ctx, audio_data);
 
     if (text.empty()) {
         fprintf(stderr, "Transcription failed or produced no output\n");

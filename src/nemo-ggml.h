@@ -322,13 +322,13 @@ std::string nemo_transcribe(
 // Run inference from raw PCM audio (16-bit signed, 16kHz, mono)
 std::vector<timed_token> nemo_encode_audio(
     struct nemo_context * ctx,
-    const int16_t * audio_data,
-    int n_samples);
+    std::vector<int16_t> & audio_data
+);
 
 std::string nemo_transcribe_audio(
     struct nemo_context * ctx,
-    const int16_t * audio_data,
-    int n_samples);
+    std::vector<int16_t> & audio_data
+);
 
 // Token with frame index for timestamp computation
 // Time = frame_idx * frame_duration_samples / sample_rate
@@ -395,8 +395,7 @@ struct nemo_decoder_state {
 // After transcription, decoder_state is updated with final state
 std::string nemo_transcribe_audio_with_state(
     struct nemo_context * ctx,
-    const int16_t * audio_data,
-    int n_samples,
+    std::vector<const int16_t> & audio_data,
     nemo_decoder_state * decoder_state
 );
 

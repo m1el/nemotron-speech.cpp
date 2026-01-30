@@ -4,4 +4,11 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "gguf>=0.17.1",
+    "nemo-toolkit[asr]",
+    "torch>=2.10.0",
+]
+
+[tool.uv.sources]
+nemo-toolkit = { git = "https://github.com/NVIDIA/NeMo.git", rev = "main" }

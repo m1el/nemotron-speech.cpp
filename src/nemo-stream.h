@@ -25,37 +25,59 @@ struct nemo_cache_config {
     int32_t att_left_context   = 70;     // Number of past frames to cache for attention
     int32_t att_right_context  = 0;      // Lookahead frames (0=pure causal, 1/6/13 = other modes)
     int32_t cache_drop_size    = 0;      // Frames to drop from cache per step (0 for chunked_limited)
-    
+
     // Convolution cache settings
     int32_t conv_kernel_size   = 9;      // Depthwise conv kernel size (from model config)
     int32_t conv_cache_size    = 8;      // kernel_size - 1
-    
+
     // Model dimensions
     int32_t d_model            = 1024;   // Model dimension
     int32_t n_layers           = 24;     // Number of conformer layers
     int32_t n_heads            = 8;      // Number of attention heads
     int32_t d_head             = 128;    // Head dimension
-    
+
     // Subsampling settings
     int32_t subsampling_factor = 8;      // Mel frames to encoder frames ratio
     int32_t n_mels             = 128;    // Number of mel features
-    
+
     // Audio settings
     int32_t sample_rate        = 16000;  // Audio sample rate
     int32_t hop_length         = 160;    // Mel hop length (10ms at 16kHz)
-    
+
     // Decoder settings
     int32_t decoder_hidden     = 640;    // LSTM hidden size
     int32_t decoder_layers     = 2;      // Number of LSTM layers
     int32_t vocab_size         = 1025;   // Vocabulary size (including blank)
     int32_t blank_token        = 1024;   // Blank token ID
+
+    // Streaming post-processing settings (from NeMo streaming_cfg)
+    int32_t valid_out_len      = 1;      // Number of encoder frames to output per chunk
+    int32_t drop_extra_pre_encoded = 2;  // Frames to drop from start after subsampling
+    int32_t last_channel_cache_size = 70; // Max size for attention cache (same as att_left_context)
+    int32_t pre_encode_cache_size = 9;   // Overlap mel frames for conv subsampling context
+    int32_t shift_mel_frames   = 8;      // Mel frames to advance per chunk (NeMo shift_size)
     
     // Compute chunk_mel_frames based on att_right_context
-    // Formula: chunk_size = subsampling_factor * (1 + att_right_context)
-    // For pure causal (att_right_context=0): 8 * 1 = 8 mel frames = 80ms
-    // For default (att_right_context=13): 8 * 14 = 112 mel frames = 1.12s
-    int32_t get_chunk_mel_frames() const {
-        return subsampling_factor * (1 + att_right_context);
+    // This is the total mel frames needed for one encoder step (including overlap)
+    // Formula: chunk_size = pre_encode_cache_size + shift_mel_frames
+    // For pure causal: 9 + 8 = 17 mel frames = 170ms input
+    // For default (att_right_context=13): 9 + 8*(1+13) = 121 mel frames
+    size_t get_chunk_mel_frames() const {
+        // NeMo formula: sampling_frames[1] + subsampling_factor * lookahead_steps
+        // where lookahead_steps = att_right_context
+        // Plus pre_encode_cache_size for the overlap
+        int32_t lookahead_steps = att_right_context;
+        int32_t chunk_without_cache = subsampling_factor + subsampling_factor * lookahead_steps;
+        return pre_encode_cache_size + chunk_without_cache;
+    }
+
+    // Get the number of mel frames to shift/advance per chunk
+    // This determines how many new mel frames are consumed each step
+    size_t get_shift_mel_frames() const {
+        // NeMo formula: shift_size[1] = sampling_frames[1] + sampling_frames[1] * (lookahead_steps - cache_drop_size)
+        // For pure causal with cache_drop_size=0: 8 + 8*0 = 8
+        int32_t lookahead_steps = att_right_context;
+        return subsampling_factor + subsampling_factor * (lookahead_steps - cache_drop_size);
     }
     
     // Compute chunk audio samples based on latency mode
@@ -98,82 +120,6 @@ struct nemo_cache_config {
 };
 
 // =============================================================================
-// Per-Layer Cache Structures
-// =============================================================================
-
-// Attention cache for one conformer layer
-// Stores K and V for left_context past frames
-struct nemo_layer_attn_cache {
-    std::vector<float> k_cache;   // [cache_len, d_model] flattened
-    std::vector<float> v_cache;   // [cache_len, d_model] flattened
-    int32_t cache_len;            // Current valid cache length (0 to max_cache_len)
-    int32_t max_cache_len;        // Maximum cache size (= att_left_context)
-    int32_t d_model;              // Model dimension
-    
-    void init(int32_t max_len, int32_t dim);
-    void reset();
-    
-    // Append new K/V and trim to max_cache_len
-    void update(const float* k_new, const float* v_new, int32_t new_len);
-    
-    // Get pointers for graph building
-    const float* k_data() const { return k_cache.data(); }
-    const float* v_data() const { return v_cache.data(); }
-};
-
-// Convolution cache for one conformer layer
-// Stores the tail of the input for causal depthwise conv1d
-struct nemo_layer_conv_cache {
-    std::vector<float> cache;     // [d_model, kernel_size-1] flattened, channels-first
-    int32_t cache_len;            // kernel_size - 1
-    int32_t d_model;              // Model dimension
-    
-    void init(int32_t kernel_size, int32_t dim);
-    void reset();
-    
-    // Update cache with new data (takes last kernel_size-1 frames)
-    void update(const float* new_data, int32_t seq_len);
-    
-    const float* data() const { return cache.data(); }
-};
-
-// =============================================================================
-// Full Encoder Cache
-// =============================================================================
-
-// Complete cache state for streaming encoder
-struct nemo_encoder_cache {
-    nemo_cache_config config;
-    
-    // Per-layer caches
-    std::vector<nemo_layer_attn_cache> attn_caches;  // [n_layers]
-    std::vector<nemo_layer_conv_cache> conv_caches;  // [n_layers]
-    
-    // Subsampling cache (for mel frames that don't fit complete chunk)
-    std::vector<float> mel_buffer;   // Buffered mel frames
-    int32_t mel_buffer_len;          // Number of buffered mel frames
-
-    // Audio buffer (for samples that don't fit complete chunk)
-    std::vector<int16_t> audio_buffer;
-
-    // Streaming audio buffer for STFT overlap
-    // We need to keep some audio history for proper STFT windowing
-    std::vector<float> audio_history;  // Float audio with pre-emphasis applied
-    int32_t audio_history_len;         // Valid samples in history
-    float last_sample;                 // Last sample for pre-emphasis continuity
-
-    // Frame tracking for true streaming
-    int64_t total_encoder_frames;      // Total encoder frames processed so far
-    
-    // Initialization and reset
-    void init(const nemo_cache_config& cfg);
-    void reset();
-    
-    // Memory usage calculation
-    size_t memory_usage_bytes() const;
-};
-
-// =============================================================================
 // Decoder State - defined in nemo-ggml.h
 // =============================================================================
 // nemo_decoder_state is defined in nemo-ggml.h
@@ -190,6 +136,7 @@ struct nemo_encoder_graph {
     
     // Input tensors (set data before compute)
     struct ggml_tensor* mel_input;     // [n_mels, chunk_frames, 1]
+    struct ggml_tensor* attn_mask;     // [kv_len, 1] attention mask for invalid cache positions
     std::vector<struct ggml_tensor*> k_cache_ins;   // [n_layers]
     std::vector<struct ggml_tensor*> v_cache_ins;   // [n_layers]
     std::vector<struct ggml_tensor*> conv_cache_ins; // [n_layers]
@@ -202,11 +149,17 @@ struct nemo_encoder_graph {
     
     bool initialized;
     
-    nemo_encoder_graph() : ctx(nullptr), graph(nullptr), allocr(nullptr), 
-                           mel_input(nullptr), encoder_out(nullptr), initialized(false) {}
+    nemo_encoder_graph() : ctx(nullptr), graph(nullptr), allocr(nullptr),
+                           mel_input(nullptr), attn_mask(nullptr), encoder_out(nullptr), initialized(false) {}
     ~nemo_encoder_graph();
     
-    void init(struct nemo_context* nctx, const nemo_cache_config& cfg, int mel_chunk_frames);
+    void init(struct nemo_context* nctx, const nemo_cache_config& cfg);
+    void build_streaming_encoder(
+        struct ggml_context * ctx,
+        struct nemo_context* nctx,
+        const nemo_cache_config& cfg,
+        size_t drop_extra_preencoded
+    );
     void reset();
 };
 
@@ -218,14 +171,20 @@ struct nemo_stream_context {
     // Cache configuration
     nemo_cache_config config;
 
-    // Encoder caches
-    nemo_encoder_cache encoder_cache;
-
     // Decoder state
     nemo_decoder_state decoder_state;
 
     // Pre-built encoder graph (reused across chunks)
     nemo_encoder_graph encoder_graph;
+
+    // Overlap settings (derived from config)
+    size_t overlap_mel_frames() const {
+        return config.pre_encode_cache_size;
+    }
+
+    size_t shift_mel_frames() const {
+        return config.get_shift_mel_frames();
+    }
 
     // Pre-built decoder/joint graph (reused across decode steps)
     struct ggml_context* decode_ctx;
@@ -238,11 +197,17 @@ struct nemo_stream_context {
     struct ggml_tensor* decode_logits;
     struct ggml_tensor* decode_h_out;
     struct ggml_tensor* decode_c_out;
+
+    struct ggml_tensor* cache_last_channel;
+    struct ggml_tensor* cache_next_channel;
+    struct ggml_tensor* cache_last_time;
+    struct ggml_tensor* cache_next_time;
+    struct ggml_tensor* cache_last_channel_len;
+    struct ggml_tensor* cache_next_channel_len;
     bool decode_graph_initialized;
 
-    // CPU-side copies of preprocessor weights for streaming mel conversion
-    std::vector<float> filterbank_cpu;   // [n_mels * n_bins]
-    std::vector<float> window_cpu;       // [n_window_size]
+    // MEL buffer
+    std::vector<float> mel_buffer;
 
     // Accumulated tokens from this session
     std::vector<int> tokens;
@@ -253,7 +218,14 @@ struct nemo_stream_context {
     // Timing stats
     double total_audio_seconds;
     double total_compute_seconds;
-    
+
+    // Cache validity tracking (for attention masking)
+    // Starts at 0, grows by chunk_len each chunk, capped at cache_len
+    int cache_valid_len;
+
+    // Chunk counter for debugging
+    int total_chunks_processed;
+
     // Initialize from model context
     void init(struct nemo_context* ctx, const nemo_cache_config& cfg);
     void reset();
@@ -338,6 +310,7 @@ struct ggml_tensor* build_cached_rel_pos_mha(
     struct ggml_tensor* k_cache_in,     // [d_model, cache_len] or nullptr
     struct ggml_tensor* v_cache_in,     // [d_model, cache_len] or nullptr
     struct ggml_tensor* pos_emb,        // [d_model, pos_len]
+    struct ggml_tensor* attn_mask,      // [kv_len, 1] attention mask (0=valid, -1e9=masked)
     nemo_conformer_layer* layer,
     int n_heads,
     int d_head,
@@ -373,22 +346,22 @@ struct ggml_tensor* build_cached_conformer_layer(
     struct ggml_tensor* v_cache_in,
     struct ggml_tensor* conv_cache_in,
     struct ggml_tensor* pos_emb,
+    struct ggml_tensor* attn_mask,      // [kv_len, 1] attention mask (0=valid, -1e9=masked)
     nemo_conformer_layer* layer,
     const nemo_cache_config* config,
     struct ggml_tensor** k_cache_out,
     struct ggml_tensor** v_cache_out,
-    struct ggml_tensor** conv_cache_out
+    struct ggml_tensor** conv_cache_out,
+    int layer_idx                       // Layer index for debugging
 );
 
 // Build full streaming encoder step
 // mel_chunk: [n_mels, chunk_frames, batch]
-// Uses and updates encoder_cache internally
 // Returns: [d_model, valid_out_len, batch]
 struct ggml_tensor* build_streaming_encoder(
     struct ggml_context* ctx,
     struct ggml_tensor* mel_chunk,
-    nemo_model* model,
-    nemo_encoder_cache* cache
+    nemo_model* model
 );
 
 #endif // NEMO_STREAM_H

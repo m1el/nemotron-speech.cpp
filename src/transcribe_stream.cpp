@@ -6,8 +6,8 @@
 //
 // Input: Raw PCM audio: 16-bit signed, 16kHz, mono
 
-#include "../src-ggml/nemo-ggml.h"
-#include "../src-ggml/nemo-stream.h"
+#include "nemo-ggml.h"
+#include "nemo-stream.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -102,7 +102,7 @@ int main(int argc, char ** argv) {
     size_t file_size = audio_file.tellg();
     audio_file.seekg(0, std::ios::beg);
 
-    int total_samples = file_size / sizeof(int16_t);
+    int total_samples = file_size / sizeof(int16_t) + 159; // padding for conv context
     std::vector<int16_t> audio_data(total_samples);
 
     audio_file.read(reinterpret_cast<char*>(audio_data.data()), file_size);
@@ -145,12 +145,11 @@ int main(int argc, char ** argv) {
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    int chunks_processed = 0;
     int samples_processed = 0;
 
     // Track incremental transcript
-    printf("Transcription: ");
-    fflush(stdout);
+    // printf("Transcription: ");
+    // fflush(stdout);
 
     while (samples_processed < total_samples) {
         int remaining = total_samples - samples_processed;
@@ -160,7 +159,7 @@ int main(int argc, char ** argv) {
         const int16_t * chunk_ptr = audio_data.data() + samples_processed;
 
         // Process chunk - NOW RETURNS TEXT IMMEDIATELY
-        std::string new_text = nemo_stream_process(sctx, chunk_ptr, n_samples);
+        std::string new_text = nemo_stream_process_incremental(sctx, chunk_ptr, n_samples);
 
         // Print incremental text as it arrives
         if (!new_text.empty()) {
@@ -169,15 +168,8 @@ int main(int argc, char ** argv) {
         }
 
         samples_processed += n_samples;
-        chunks_processed++;
     }
 
-    // Finalize - flush any remaining buffered audio
-    std::string final_text = nemo_stream_finalize(sctx);
-    if (!final_text.empty()) {
-        // Final text might have additional tokens from flush
-        // But nemo_stream_finalize returns full transcript, so just newline
-    }
     printf("\n");
 
     auto end_time = std::chrono::high_resolution_clock::now();
@@ -187,7 +179,7 @@ int main(int argc, char ** argv) {
 
     // Print statistics
     printf("\nStatistics:\n");
-    printf("  Chunks processed:    %d\n", chunks_processed);
+    printf("  Chunks processed:    %d\n", sctx->total_chunks_processed);
     printf("  Audio duration:      %.2f sec\n", total_duration_sec);
     printf("  Processing time:     %.2f sec\n", processing_time_sec);
     printf("  Real-time factor:    %.3fx\n", processing_time_sec / total_duration_sec);

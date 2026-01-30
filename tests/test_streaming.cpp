@@ -661,6 +661,7 @@ bool test_cached_conformer_layer(struct nemo_context* ctx) {
         ctx0, inp,
         nullptr, nullptr, nullptr,  // No cache for first chunk
         pos_emb,
+        nullptr,  // No attention mask for uncached inference
         &ctx->model.encoder.layers[0],
         &config,
         &k_cache_out, &v_cache_out, &conv_cache_out
