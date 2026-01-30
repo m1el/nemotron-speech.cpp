@@ -1,0 +1,65 @@
+ASRModel: EncDecRNNTBPEModel(input_signal=None, input_signal_length=None, processed_signal=None, processed_signal_length=None)
+  preprocessor: AudioToMelSpectrogramPreprocessor(input_signal, length)
+    featurizer: FilterbankFeatures(x, seq_len, linear_spec=False)
+  encoder: ConformerEncoder(audio_signal, length, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None, bypass_pre_encode=False) | ({'audio_signal': Tensor[1, 128, 17], 'length': Tensor[1], 'cache_last_channel': Tensor[24, 1, 70, 1024], 'cache_last_time': Tensor[24, 1, 1024, 8], 'cache_last_channel_len': Tensor[1], 'bypass_pre_encode': 'bool'},) -> (Tensor[1, 1024, 1], Tensor[1], Tensor[24, 1, 70, 1024], Tensor[24, 1, 1024, 8], Tensor[1])
+    pre_encode: ConvSubsampling(x, lengths) | ({'x': Tensor[1, 17, 128], 'lengths': Tensor[1]},) -> (Tensor[1, 3, 1024], Tensor[1])
+      out: Linear(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 3, 4352],) -> Tensor[1, 3, 1024]
+      conv: MaskedConvSequential(x, lengths) | (Tensor[1, 17, 128], Tensor[1]) -> (Tensor[1, 256, 3, 17], Tensor[1])
+        0: CausalConv2D(x) | (Tensor[1, 1, 17, 128],) -> Tensor[1, 256, 9, 65]
+        1: ReLU(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 256, 3, 17],) -> Tensor[1, 256, 3, 17]
+        2: CausalConv2D(x) | (Tensor[1, 256, 9, 65],) -> Tensor[1, 256, 5, 33]
+        3: Conv2d(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 256, 5, 33],) -> Tensor[1, 256, 5, 33]
+        5: CausalConv2D(x) | (Tensor[1, 256, 5, 33],) -> Tensor[1, 256, 3, 17]
+        6: Conv2d(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 256, 3, 17],) -> Tensor[1, 256, 3, 17]
+    pos_enc: RelPositionalEncoding(x, cache_len=0) | ({'x': Tensor[1, 1, 1024], 'cache_len': 'int'},) -> (Tensor[1, 1, 1024], Tensor[1, 141, 1024])
+      dropout: Dropout(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 1024],) -> Tensor[1, 1, 1024]
+    layers: ModuleList(*input: Any) -> None
+      0: ConformerLayer(x, att_mask=None, pos_emb=None, pad_mask=None, cache_last_channel=None, cache_last_time=None) | ({'x': Tensor[1, 1, 1024], 'att_mask': Tensor[1, 1, 71], 'pos_emb': Tensor[1, 141, 1024], 'pad_mask': Tensor[1, 1], 'cache_last_channel': Tensor[1, 70, 1024], 'cache_last_time': Tensor[1, 1024, 8]},) -> (Tensor[1, 1, 1024], Tensor[1, 70, 1024], Tensor[1, 1024, 8])
+        norm_feed_forward1: LayerNorm(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 1024],) -> Tensor[1, 1, 1024]
+        feed_forward1: ConformerFeedForward(x) | (Tensor[1, 1, 1024],) -> Tensor[1, 1, 1024]
+          linear1: Linear(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 1024],) -> Tensor[1, 1, 4096]
+          activation: Swish(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 4096],) -> Tensor[1, 1, 4096]
+          dropout: Dropout(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 4096],) -> Tensor[1, 1, 4096]
+          linear2: Linear(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 4096],) -> Tensor[1, 1, 1024]
+        norm_conv: LayerNorm(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 1024],) -> Tensor[1, 1, 1024]
+        conv: ConformerConvolution(x, pad_mask=None, cache=None) | (Tensor[1, 1, 1024], {'pad_mask': Tensor[1, 1], 'cache': Tensor[1, 1024, 8]}) -> (Tensor[1, 1, 1024], Tensor[1, 1024, 8])
+          pointwise_conv1: Conv1d(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1024, 1],) -> Tensor[1, 2048, 1]
+          depthwise_conv: CausalConv1D(x, cache=None) | (Tensor[1, 1024, 1], {'cache': Tensor[1, 1024, 8]}) -> (Tensor[1, 1024, 1], Tensor[1, 1024, 8])
+          batch_norm: LayerNorm(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 1024],) -> Tensor[1, 1, 1024]
+          activation: Swish(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1024, 1],) -> Tensor[1, 1024, 1]
+          pointwise_conv2: Conv1d(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1024, 1],) -> Tensor[1, 1024, 1]
+        norm_self_att: LayerNorm(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 1024],) -> Tensor[1, 1, 1024]
+        self_attn: RelPositionMultiHeadAttention(query, key, value, mask, pos_emb, cache=None) | ({'query': Tensor[1, 1, 1024], 'key': Tensor[1, 1, 1024], 'value': Tensor[1, 1, 1024], 'mask': Tensor[1, 1, 71], 'pos_emb': Tensor[1, 141, 1024], 'cache': Tensor[1, 70, 1024]},) -> (Tensor[1, 1, 1024], Tensor[1, 70, 1024])
+          linear_q: Linear(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 1024],) -> Tensor[1, 1, 1024]
+          linear_k: Linear(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 71, 1024],) -> Tensor[1, 71, 1024]
+          linear_v: Linear(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 71, 1024],) -> Tensor[1, 71, 1024]
+          linear_out: Linear(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 1024],) -> Tensor[1, 1, 1024]
+          dropout: Dropout(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 8, 1, 71],) -> Tensor[1, 8, 1, 71]
+          linear_pos: Linear(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 141, 1024],) -> Tensor[1, 141, 1024]
+        norm_feed_forward2: LayerNorm(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 1024],) -> Tensor[1, 1, 1024]
+        feed_forward2: ConformerFeedForward(x) | (Tensor[1, 1, 1024],) -> Tensor[1, 1, 1024]
+          linear1: Linear(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 1024],) -> Tensor[1, 1, 4096]
+          dropout: Dropout(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 4096],) -> Tensor[1, 1, 4096]
+          linear2: Linear(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 4096],) -> Tensor[1, 1, 1024]
+        dropout: Dropout(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 1024],) -> Tensor[1, 1, 1024]
+        norm_out: LayerNorm(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 1024],) -> Tensor[1, 1, 1024]
+    cache_aware_stream_step: method(processed_signal, processed_signal_length=None, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None, keep_all_outputs=True, drop_extra_pre_encoded=None, bypass_pre_encode=False) | ({'processed_signal': Tensor[1, 128, 17], 'processed_signal_length': Tensor[1], 'cache_last_channel': Tensor[24, 1, 70, 1024], 'cache_last_time': Tensor[24, 1, 1024, 8], 'cache_last_channel_len': Tensor[1], 'keep_all_outputs': 'bool', 'drop_extra_pre_encoded': 'int', 'bypass_pre_encode': 'bool'},) -> (Tensor[1, 1024, 1], Tensor[1], Tensor[24, 1, 70, 1024], Tensor[24, 1, 1024, 8], Tensor[1])
+  decoder: RNNTDecoder(targets, target_length, states=None)
+    prediction: ModuleDict(*input: Any) -> None
+      embed: Embedding(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1],) -> Tensor[1, 1, 640]
+      dec_rnn: LSTMDropout(x: torch.Tensor, h: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] | (Tensor[1, 1, 640], (Tensor[2, 1, 640], Tensor[2, 1, 640])) -> (Tensor[1, 1, 640], (Tensor[2, 1, 640], Tensor[2, 1, 640]))
+        lstm: LSTM(input, hx=None) | (Tensor[1, 1, 640], (Tensor[2, 1, 640], Tensor[2, 1, 640])) -> (Tensor[1, 1, 640], (Tensor[2, 1, 640], Tensor[2, 1, 640]))
+        dropout: Dropout(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 640],) -> Tensor[1, 1, 640]
+  joint: RNNTJoint(encoder_outputs: torch.Tensor, decoder_outputs: Optional[torch.Tensor], encoder_lengths: Optional[torch.Tensor] = None, transcripts: Optional[torch.Tensor] = None, transcript_lengths: Optional[torch.Tensor] = None, compute_wer: bool = False) -> Union[torch.Tensor, List[Optional[torch.Tensor]]]
+    pred: Linear(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 640],) -> Tensor[1, 1, 640]
+    enc: Linear(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 1024],) -> Tensor[1, 1, 640]
+    joint_net: Sequential(input) | (Tensor[1, 1, 1, 640],) -> Tensor[1, 1, 1, 1025]
+      0: ReLU(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 1, 640],) -> Tensor[1, 1, 1, 640]
+      1: Dropout(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 1, 640],) -> Tensor[1, 1, 1, 640]
+      2: Linear(input: torch.Tensor) -> torch.Tensor | (Tensor[1, 1, 1, 640],) -> Tensor[1, 1, 1, 1025]
+    _loss: RNNTLoss(log_probs, targets, input_lengths, target_lengths)
+      _loss: RNNTLossNumba(acts, labels, act_lens, label_lens)
+    _wer: WER(*args: Any, **kwargs: Any) -> Any
+  spec_augmentation: SpectrogramAugmentation(input_spec, length)
+    spec_augment: SpecAugment(input_spec, length)
+  conformer_stream_step: method(processed_signal: torch.Tensor, processed_signal_length: torch.Tensor = None, cache_last_channel: torch.Tensor = None, cache_last_time: torch.Tensor = None, cache_last_channel_len: torch.Tensor = None, keep_all_outputs: bool = True, previous_hypotheses: List[nemo.collections.asr.parts.utils.rnnt_utils.Hypothesis] = None, previous_pred_out: torch.Tensor = None, drop_extra_pre_encoded: int = None, return_transcription: bool = True, return_log_probs: bool = False, bypass_pre_encode: bool = False) | ({'processed_signal': Tensor[1, 128, 17], 'processed_signal_length': Tensor[1], 'cache_last_channel': Tensor[24, 1, 70, 1024], 'cache_last_time': Tensor[24, 1, 1024, 8], 'cache_last_channel_len': Tensor[1], 'keep_all_outputs': 'bool', 'previous_hypotheses': 'NoneType', 'previous_pred_out': 'NoneType', 'drop_extra_pre_encoded': 'int', 'return_transcription': 'bool'},) -> ([Tensor[0]], ['Hypothesis'], Tensor[24, 1, 70, 1024], Tensor[24, 1, 1024, 8], Tensor[1], ['Hypothesis'])
