@@ -4,7 +4,6 @@ This is a rewrite of Automatic Speech Recognition from NVidia's NeMo framework.
 
 The goal of this project is to have a fast-loading, low-dependency speech recognition software. This program only uses [ggml-org/ggml](https://github.com/ggml-org/ggml) library to work with neural networks.
 
-
 ## Demo
 
 [![asciicast](https://asciinema.org/a/J1MAnH3Z93HIBMBA.svg)](https://asciinema.org/a/J1MAnH3Z93HIBMBA)
@@ -53,6 +52,13 @@ Once you have built ggml, you can build this binary
 make nemotron-asr.cpp
 ```
 
-## License 
+## Comparison to [whisper.cpp](https://github.com/ggml-org/whisper.cpp)?
+
+1) Whisper operates on 30s audio chunks, so it is not feasible to use in interactive applications.
+NeMotron's ASR model has configurable latency (from 80ms to 1.12s), which can traded for quality and speed. (bigger lookahead gives better quality and bigger chunks require less work)
+2) Whisper has troubles on long audio streams, where NeMotron's ASR is a streaming model, works for infinite streams. It does get stuck in lowercase mode though.
+3) Quiality seems to be better
+
+## License
 
 MIT

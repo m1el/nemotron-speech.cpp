@@ -46,9 +46,10 @@ ORIG_SRCS = src/reference/ggml_weights.cpp src/reference/ops.cpp src/reference/c
 
 .PHONY: all clean clean_bin test transcribe streaming
 
-all: test_ggml_weights test_ggml_compute transcribe streaming
+all: nemotron-asr.cpp
+# test_ggml_weights test_ggml_compute transcribe streaming
 
-streaming: test_streaming transcribe_stream
+streaming: test_streaming nemotron-asr.cpp
 
 # Test weight loading
 test_ggml_weights: tests/test_weights.cpp $(GGML_SRCS) $(ORIG_SRCS)
@@ -79,7 +80,7 @@ test_preprocessor: tests/test_preprocessor.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 # Streaming transcribe example
-transcribe_stream: src/transcribe_stream.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
+nemotron-asr.cpp: src/transcribe_stream.cpp $(GGML_SRCS) $(GGML_STREAM_SRCS)
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
 clean:
