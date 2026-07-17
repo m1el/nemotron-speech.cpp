@@ -7,6 +7,10 @@
 #include <cmath>
 #include <fstream>
 
+#ifdef NEMO_HAVE_WEBGPU
+#include "ggml-webgpu.h"
+#endif
+
 // Maximum nodes in computation graph
 #define NEMO_MAX_NODES 8192
 
@@ -62,6 +66,19 @@ static bool init_backend(nemo_model & model, nemo_backend_type backend_type) {
                 printf("%s: CUDA memory: %.1f / %.1f GB available\n", __func__,
                        free_mem / 1e9, total_mem / 1e9);
             }
+        }
+    }
+#endif
+
+#ifdef NEMO_HAVE_WEBGPU
+    if (backend_type == NEMO_BACKEND_WEBGPU) {
+        model.backend = ggml_backend_webgpu_init();
+        if (model.backend) {
+            model.backend_type = NEMO_BACKEND_WEBGPU;
+            printf("%s: using WebGPU backend\n", __func__);
+        } else {
+            fprintf(stderr, "%s: WebGPU backend requested but init failed\n", __func__);
+            return false;
         }
     }
 #endif
@@ -925,13 +942,46 @@ static struct ggml_tensor * build_causal_conv2d(
     return ggml_add(ctx, conv_out, bias_reshaped);
 }
 
-// Helper: build causal depthwise conv2d using ggml_conv_2d_dw_direct (F32)
+// APPROACH 1: depthwise conv2d as im2col + mul_mat, with an F32 im2col.
+//
+// Why this exists: the subsampling uses a depthwise conv2d. ggml's single-op form,
+// ggml_conv_2d_dw_direct (GGML_OP_CONV_2D_DW), is implemented by CPU/CUDA/Metal but
+// NOT by the WebGPU backend. ggml's lowering helper ggml_conv_2d_dw would run on
+// WebGPU, but it emits an F16 im2col that the CPU backend's mul_mat rejects against
+// our F32 weights (GGML_ASSERT(src1->type == F32)). So we mirror that lowering here
+// but force an F32 im2col, which every backend accepts. Output layout [OW,OH,C,N]
+// matches the direct op, so it's a drop-in substitute for WebGPU.
+static struct ggml_tensor * build_dw_conv2d_im2col(
+    struct ggml_context * ctx,
+    struct ggml_tensor * weight,  // [KW, KH, 1, C]
+    struct ggml_tensor * padded,  // [W, H, C, N] (already padded)
+    int stride_w, int stride_h
+) {
+    struct ggml_tensor * a = weight;
+    struct ggml_tensor * b = padded;
+    struct ggml_tensor * ka = ggml_reshape_4d(ctx, a, a->ne[0], a->ne[1], 1, a->ne[2] * a->ne[3]);
+    struct ggml_tensor * im2col = ggml_im2col(ctx, ka,
+        ggml_reshape_4d(ctx, b, b->ne[0], b->ne[1], 1, b->ne[2] * b->ne[3]),
+        stride_w, stride_h, 0, 0, 1, 1, /*is_2D=*/true, GGML_TYPE_F32);
+    struct ggml_tensor * col = ggml_reshape_4d(ctx, im2col, im2col->ne[0],
+        im2col->ne[2] * im2col->ne[1], b->ne[2], b->ne[3]);
+    ka = ggml_reshape_4d(ctx, ka, ka->ne[0] * ka->ne[1], ka->ne[2], ka->ne[3], 1);
+    struct ggml_tensor * conv_out = ggml_mul_mat(ctx, ka, col);
+    return ggml_reshape_4d(ctx, conv_out, im2col->ne[1], im2col->ne[2], b->ne[2], b->ne[3]);
+}
+
+// Helper: build causal depthwise conv2d, choosing the implementation by backend.
+//   CPU / CUDA / Metal      -> ggml_conv_2d_dw_direct (native GGML_OP_CONV_2D_DW).
+//   WebGPU, no custom kernel -> Approach 1 (im2col + mul_mat) [default].
+//   WebGPU, NEMO_WEBGPU_DW_KERNEL defined -> Approach 2: the direct op dispatches to a
+//                                            custom WGSL CONV_2D_DW kernel in ggml-webgpu.
 static struct ggml_tensor * build_causal_dw_conv2d(
     struct ggml_context * ctx,
     struct ggml_tensor * input,   // [W, H, C, N]
     struct ggml_tensor * weight,  // [KW, KH, 1, C]
     struct ggml_tensor * bias,    // [C]
-    int stride_w, int stride_h
+    int stride_w, int stride_h,
+    nemo_backend_type backend
 ) {
     int kW = weight->ne[0];
     int kH = weight->ne[1];
@@ -941,7 +991,20 @@ static struct ggml_tensor * build_causal_dw_conv2d(
     int pad_bottom = stride_h - 1;
 
     struct ggml_tensor * padded = ggml_pad_ext(ctx, input, pad_left, pad_right, pad_top, pad_bottom, 0, 0, 0, 0);
-    struct ggml_tensor * conv_out = ggml_conv_2d_dw_direct(ctx, weight, padded, stride_w, stride_h, 0, 0, 1, 1);
+
+    struct ggml_tensor * conv_out;
+    if (backend == NEMO_BACKEND_WEBGPU) {
+#ifdef NEMO_WEBGPU_DW_KERNEL
+        // Approach 2: WebGPU has a custom depthwise-conv kernel; use the direct op.
+        conv_out = ggml_conv_2d_dw_direct(ctx, weight, padded, stride_w, stride_h, 0, 0, 1, 1);
+#else
+        // Approach 1: WebGPU lacks GGML_OP_CONV_2D_DW; lower to im2col + mul_mat.
+        conv_out = build_dw_conv2d_im2col(ctx, weight, padded, stride_w, stride_h);
+#endif
+    } else {
+        // CPU / CUDA / Metal implement the direct op natively (and it's faster there).
+        conv_out = ggml_conv_2d_dw_direct(ctx, weight, padded, stride_w, stride_h, 0, 0, 1, 1);
+    }
 
     // Add bias
     int channels = weight->ne[3];
@@ -954,7 +1017,8 @@ static struct ggml_tensor * build_causal_dw_conv2d(
 struct ggml_tensor * build_conv_subsampling(
     struct ggml_context * ctx,
     struct ggml_tensor * mel,           // [n_mels, time, batch]
-    nemo_conv_subsampling * sub         // weights
+    nemo_conv_subsampling * sub,        // weights
+    nemo_backend_type backend           // selects the depthwise-conv implementation
 ) {
     int64_t n_mels = mel->ne[0];
     int64_t time_in = mel->ne[1];
@@ -975,7 +1039,7 @@ struct ggml_tensor * build_conv_subsampling(
     ggml_set_output(cur);
 
     // Conv2: Depthwise CausalConv2D(256, k=3, s=2, groups=256)
-    cur = build_causal_dw_conv2d(ctx, cur, sub->conv2_w, sub->conv2_b, 2, 2);
+    cur = build_causal_dw_conv2d(ctx, cur, sub->conv2_w, sub->conv2_b, 2, 2, backend);
     ggml_set_name(cur, "conv_layer2");
     ggml_set_output(cur);
 
@@ -991,7 +1055,7 @@ struct ggml_tensor * build_conv_subsampling(
     ggml_set_output(cur);
 
     // Conv5: Depthwise CausalConv2D(256, k=3, s=2, groups=256)
-    cur = build_causal_dw_conv2d(ctx, cur, sub->conv5_w, sub->conv5_b, 2, 2);
+    cur = build_causal_dw_conv2d(ctx, cur, sub->conv5_w, sub->conv5_b, 2, 2, backend);
     ggml_set_name(cur, "conv_layer5");
     ggml_set_output(cur);
 
@@ -1047,7 +1111,7 @@ struct ggml_tensor * build_encoder(
     const int d_model = model->hparams.d_model;     // 1024
 
     // 1. ConvSubsampling: [n_mels, time, batch] -> [d_model, time/8, batch]
-    struct ggml_tensor * cur = build_conv_subsampling(ctx, mel, &model->encoder.subsampling);
+    struct ggml_tensor * cur = build_conv_subsampling(ctx, mel, &model->encoder.subsampling, model->backend_type);
     // ggml_set_name(cur, "pre_encoded");  // [d_model, time/8, batch]
     // ggml_set_output(cur);
 

@@ -28,6 +28,7 @@ enum nemo_backend_type {
     NEMO_BACKEND_CUDA = 1,
     NEMO_BACKEND_METAL = 2,
     NEMO_BACKEND_AUTO = 3,  // Auto-detect: prefer CUDA if available
+    NEMO_BACKEND_WEBGPU = 4,  // Browser WebGPU (WASM builds with NEMO_HAVE_WEBGPU)
 };
 
 // Forward declaration
@@ -308,7 +309,8 @@ struct ggml_tensor * build_conformer_layer(
 struct ggml_tensor * build_conv_subsampling(
     struct ggml_context * ctx,
     struct ggml_tensor * mel,           // [n_mels, time, batch]
-    nemo_conv_subsampling * subsampling // weights
+    nemo_conv_subsampling * subsampling,// weights
+    nemo_backend_type backend           // selects depthwise-conv implementation
 );
 
 // Build decoder step: embedding + 2-layer LSTM

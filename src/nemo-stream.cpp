@@ -147,7 +147,7 @@ void nemo_encoder_graph::build_streaming_encoder(
     ggml_set_input(mel_input);
 
     // Run subsampling
-    struct ggml_tensor* subsampled = build_conv_subsampling(ctx, mel_input, &nctx->model.encoder.subsampling);
+    struct ggml_tensor* subsampled = build_conv_subsampling(ctx, mel_input, &nctx->model.encoder.subsampling, nctx->model.backend_type);
     
     // Drop extra pre-encoded frames from the START (overlap with cache)
     // NeMo: audio_signal = audio_signal[:, drop_extra_pre_encoded:, :]
